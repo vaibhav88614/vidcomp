@@ -1,120 +1,144 @@
-"""Qt worker classes for scanning and deletion.
+"""Qt worker threads that run the engine off the GUI thread.
 
-Both classes are :class:`QObject` subclasses designed to be moved onto a
-``QThread`` via ``QObject.moveToThread``.  They communicate with the GUI by
-emitting signals — never by touching widgets directly.
+``ScanWorker`` runs a full scan (discovery + engine) on a ``QThread`` and
+communicates exclusively through signals.  ``ThumbnailWorker`` generates a
+single thumbnail on the global ``QThreadPool``.
 """
 
 from __future__ import annotations
 
 import logging
-import threading
-import traceback
-from pathlib import Path
-from typing import Iterable, List, Optional, Set
+import time
+from typing import Optional
 
-from PySide6.QtCore import QObject, Signal, Slot
+from PySide6.QtCore import QObject, QRunnable, QThread, Signal
 
 from .config import AppConfig
-from .core import deletion
-from .core.cache import Cache
-from .core.engine import Engine, EngineResult
-from .core.models import DeletionReport, DuplicateGroup, ScanProgress
+from .core.cache import SignatureCache
+from .core.engine import DuplicateEngine, ScanStats
+from .core.keep_rules import apply_keep_rule
+from .core.media import MediaTools
+from .core.models import DuplicateGroup, VideoFile
+from .core.scanner import discover_videos
+from .core.thumbnails import ThumbnailCache
 
-LOG = logging.getLogger(__name__)
+log = logging.getLogger("vidcomp.workers")
 
 
-class ScanWorker(QObject):
-    """Runs an :class:`Engine` scan; emits progress and final groups."""
+class ScanWorker(QThread):
+    """Runs discovery + the duplicate engine in a background thread."""
 
-    progress = Signal(ScanProgress)
-    log_line = Signal(str)
-    finished = Signal(object)            # emits EngineResult
-    error = Signal(str)
+    progress = Signal(int, int, str)         # done, total, message
+    log = Signal(str)
+    error = Signal(str, str)                 # path, message
+    discovered = Signal(int)                 # number of files found
+    finished_ok = Signal(list, object)       # list[DuplicateGroup], ScanStats
+    failed = Signal(str)
 
     def __init__(
         self,
+        folder: str,
         config: AppConfig,
-        cache: Cache,
-        root: str,
+        tools: MediaTools,
+        cache: Optional[SignatureCache] = None,
         parent: Optional[QObject] = None,
     ) -> None:
         super().__init__(parent)
+        self._folder = folder
         self._config = config
+        self._tools = tools
         self._cache = cache
-        self._root = root
-        self._cancel_event = threading.Event()
-        self._engine: Optional[Engine] = None
+        self._cancel = False
+        self._start_time = 0.0
 
-    # ------------------------------------------------------------------
-    def request_cancel(self) -> None:
-        """Thread-safe — may be called from the GUI thread."""
-        self._cancel_event.set()
-        LOG.info("Scan cancel requested.")
+    def cancel(self) -> None:
+        self._cancel = True
 
     def is_cancelled(self) -> bool:
-        return self._cancel_event.is_set()
+        return self._cancel
 
-    # ------------------------------------------------------------------
-    @Slot()
-    def run(self) -> None:
-        """Worker entry point (invoked once by the QThread)."""
+    def run(self) -> None:  # noqa: D401 - QThread entry point
+        self._start_time = time.time()
+        opts = self._config.scan_options
         try:
-            self._engine = Engine(
-                config=self._config,
+            log.info(
+                "ScanWorker start: folder=%s methods=%s logic=%s workers=%d",
+                self._folder,
+                sorted(m.value for m in opts.enabled_methods),
+                opts.match_logic.value,
+                opts.worker_count,
+            )
+            self.log.emit(f"Scanning folder: {self._folder}")
+            files: list[VideoFile] = []
+            for vf in discover_videos(
+                self._folder,
+                opts.extensions,
+                opts.min_size_bytes,
+                on_error=lambda p, m: self.error.emit(p, m),
+                is_cancelled=self.is_cancelled,
+            ):
+                files.append(vf)
+                if len(files) % 50 == 0:
+                    self.progress.emit(0, 0, f"Discovered {len(files)} files...")
+            if self._cancel:
+                self.failed.emit("Scan cancelled.")
+                return
+
+            self.discovered.emit(len(files))
+            self.log.emit(f"Discovered {len(files)} candidate video file(s).")
+            if not files:
+                self.finished_ok.emit([], ScanStats())
+                return
+
+            engine = DuplicateEngine(
+                tools=self._tools,
+                options=opts,
                 cache=self._cache,
-                cancel_event=self._cancel_event,
-                progress_cb=lambda p: self.progress.emit(p),
-                log_cb=lambda line: self.log_line.emit(line),
+                on_progress=lambda d, t, m: self.progress.emit(d, t, m),
+                on_log=lambda m: self.log.emit(m),
+                on_error=lambda p, m: self.error.emit(p, m),
+                is_cancelled=self.is_cancelled,
             )
-            result = self._engine.run(self._root)
-            self.finished.emit(result)
-        except Exception as exc:  # noqa: BLE001
-            LOG.exception("Scan worker crashed")
-            tb = traceback.format_exc()
-            self.error.emit(f"{exc}\n\n{tb}")
-            # Also emit a finished signal with an empty result so the UI returns
-            # to the idle state.
-            self.finished.emit(EngineResult())
+            groups = engine.run(files)
+            if self._cancel:
+                self.failed.emit("Scan cancelled.")
+                return
+
+            apply_keep_rule(groups, self._config.keep_rule)
+            elapsed = time.time() - self._start_time
+            self.log.emit(f"Scan complete in {elapsed:.1f}s.")
+            log.info(
+                "ScanWorker done: groups=%d files=%d pairs=%d errors=%d elapsed=%.1fs",
+                engine.stats.groups_found, engine.stats.files_total,
+                engine.stats.pairs_compared, engine.stats.errors, elapsed,
+            )
+            self.finished_ok.emit(groups, engine.stats)
+        except Exception as exc:  # pragma: no cover - defensive
+            log.exception("scan worker crashed")
+            self.failed.emit(str(exc))
 
 
-class DeletionWorker(QObject):
-    """Runs a batch deletion in a worker thread."""
+class _ThumbSignals(QObject):
+    done = Signal(str, str)  # video path, thumbnail path
+    fail = Signal(str)       # video path
 
-    progress = Signal(int, int, str)     # done, total, current_path
-    finished = Signal(object)            # emits DeletionReport
-    error = Signal(str)
 
-    def __init__(
-        self,
-        paths: List[str],
-        mode: str,
-        protected_paths: Set[str],
-        quarantine_root: str = "",
-        parent: Optional[QObject] = None,
-    ) -> None:
-        super().__init__(parent)
-        self._paths = list(paths)
-        self._mode = mode
-        self._protected = set(protected_paths)
-        self._quarantine_root = quarantine_root
+class ThumbnailWorker(QRunnable):
+    """Generates one thumbnail on the global thread pool."""
 
-    # ------------------------------------------------------------------
-    @Slot()
+    def __init__(self, vf: VideoFile, cache: ThumbnailCache) -> None:
+        super().__init__()
+        self._vf = vf
+        self._cache = cache
+        self.signals = _ThumbSignals()
+
     def run(self) -> None:
         try:
-            report = deletion.delete_files(
-                paths=self._paths,
-                mode=self._mode,
-                protected_paths=self._protected,
-                quarantine_root=self._quarantine_root,
-                progress_cb=lambda done, total, p: self.progress.emit(done, total, p),
-            )
-            self.finished.emit(report)
-        except deletion.DeletionError as exc:
-            self.error.emit(str(exc))
-            self.finished.emit(DeletionReport(mode=self._mode))
-        except Exception as exc:  # noqa: BLE001
-            LOG.exception("Deletion worker crashed")
-            self.error.emit(str(exc))
-            self.finished.emit(DeletionReport(mode=self._mode))
+            path = self._cache.get_or_create(self._vf)
+            if path:
+                self.signals.done.emit(self._vf.path, path)
+            else:
+                self.signals.fail.emit(self._vf.path)
+        except Exception as exc:
+            log.debug("thumbnail worker failed for %s: %s", self._vf.path, exc)
+            self.signals.fail.emit(self._vf.path)

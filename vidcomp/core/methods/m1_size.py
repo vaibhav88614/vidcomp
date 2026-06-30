@@ -1,19 +1,30 @@
-"""M1 — file-size signature (free, instant pre-filter)."""
+"""M1 - File size match (instant pre-filter)."""
 
 from __future__ import annotations
 
 from typing import Optional
 
-from ...config import METHOD_SIZE
-from ..models import VideoFile
+from ..models import MatchEvidence, MethodId, VideoFile
 from .base import ComparisonMethod, MethodContext
 
 
 class SizeMethod(ComparisonMethod):
-    id = METHOD_SIZE
-    display_name = "File size"
-    kind = "signature"
-    description = "Group files by exact byte size — instant first-pass filter."
+    """Two files match when their byte sizes are identical.
 
-    def compute_signature(self, file: VideoFile, ctx: MethodContext) -> Optional[int]:
-        return file.size
+    This is the cheapest possible signal and primarily exists to bucket
+    candidates; on its own it is weak, so the engine usually pairs it with a
+    hash for confirmation.
+    """
+
+    method_id = MethodId.SIZE
+
+    def compare(
+        self, a: VideoFile, b: VideoFile, ctx: MethodContext
+    ) -> Optional[MatchEvidence]:
+        if a.size == b.size and a.size > 0:
+            return MatchEvidence(
+                method=MethodId.SIZE,
+                score=1.0,
+                detail=f"identical size ({a.size} bytes)",
+            )
+        return None

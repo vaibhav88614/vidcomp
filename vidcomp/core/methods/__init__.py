@@ -1,19 +1,21 @@
-"""Comparison-method plug-ins (M1..M9).
+"""Pluggable comparison methods (M1-M9).
 
-Each method exposes a class deriving from :class:`vidcomp.core.methods.base.ComparisonMethod`.
-The :data:`METHOD_REGISTRY` mapping below is the single source of truth that the
-engine and GUI use to discover available methods.
+Each method is a small class implementing :class:`ComparisonMethod`.  The
+engine instantiates the enabled methods and uses them in two phases:
 
-Methods M8 (VMAF) and M9 (audio) are only *available* if their backing
-command-line tools (``ffmpeg`` with ``libvmaf`` and ``fpcalc`` respectively)
-are present.  They are still registered so the GUI can display them disabled.
+* ``prepare(vf, ctx)`` computes any per-file signature (hash, perceptual hash,
+  metadata, fingerprint) and caches it on the :class:`VideoFile`.
+* ``compare(a, b, ctx)`` returns :class:`MatchEvidence` when two files match
+  according to that method's threshold, otherwise ``None``.
+
+Cheap methods (size/hash/metadata/pHash) are also able to bucket files quickly;
+the engine uses that to avoid an O(n^2) explosion before escalating to the
+expensive pairwise metrics (SSIM/PSNR/VMAF/audio).
 """
 
 from __future__ import annotations
 
-from typing import Dict, Iterable, List, Set, Type
-
-from .base import ComparisonMethod
+from .base import ComparisonMethod, MethodContext
 from .m1_size import SizeMethod
 from .m2_sha256 import Sha256Method
 from .m3_partial_hash import PartialHashMethod
@@ -23,68 +25,38 @@ from .m6_ssim import SsimMethod
 from .m7_psnr import PsnrMethod
 from .m8_vmaf import VmafMethod
 from .m9_audio import AudioFingerprintMethod
+from ..models import MethodId
 
-#: Ordered registry of every comparison method, cheapest first.
-METHOD_REGISTRY: Dict[str, Type[ComparisonMethod]] = {
-    SizeMethod.id: SizeMethod,
-    PartialHashMethod.id: PartialHashMethod,
-    Sha256Method.id: Sha256Method,
-    MetadataMethod.id: MetadataMethod,
-    PerceptualHashMethod.id: PerceptualHashMethod,
-    SsimMethod.id: SsimMethod,
-    PsnrMethod.id: PsnrMethod,
-    VmafMethod.id: VmafMethod,
-    AudioFingerprintMethod.id: AudioFingerprintMethod,
+# Registry mapping a method id to its implementation class.
+METHOD_REGISTRY: dict[MethodId, type[ComparisonMethod]] = {
+    MethodId.SIZE: SizeMethod,
+    MethodId.SHA256: Sha256Method,
+    MethodId.PARTIAL_HASH: PartialHashMethod,
+    MethodId.METADATA: MetadataMethod,
+    MethodId.PHASH: PerceptualHashMethod,
+    MethodId.SSIM: SsimMethod,
+    MethodId.PSNR: PsnrMethod,
+    MethodId.VMAF: VmafMethod,
+    MethodId.AUDIO: AudioFingerprintMethod,
 }
 
-ALL_METHOD_IDS: List[str] = list(METHOD_REGISTRY.keys())
 
-
-def get_method(method_id: str) -> Type[ComparisonMethod]:
-    """Look up a method class by id."""
-    return METHOD_REGISTRY[method_id]
-
-
-def instantiate_methods(method_ids: Iterable[str]) -> List[ComparisonMethod]:
-    """Return instances for the given method ids (skips unknown ids)."""
-    out: List[ComparisonMethod] = []
-    for mid in method_ids:
-        cls = METHOD_REGISTRY.get(mid)
-        if cls is not None:
-            out.append(cls())
-    return out
-
-
-def methods_for_preset(preset: str) -> Set[str]:
-    """Return the canonical enabled-method set for a preset name.
-
-    Presets:
-      * ``easy``    — size, partial-hash, sha256, metadata
-      * ``medium``  — easy + perceptual hash
-      * ``robust``  — medium + ssim, psnr, vmaf, audio
-    """
-    preset = preset.lower()
-    easy = {SizeMethod.id, PartialHashMethod.id, Sha256Method.id, MetadataMethod.id}
-    if preset == "easy":
-        return set(easy)
-    if preset == "medium":
-        return easy | {PerceptualHashMethod.id}
-    if preset == "robust":
-        return easy | {
-            PerceptualHashMethod.id,
-            SsimMethod.id,
-            PsnrMethod.id,
-            VmafMethod.id,
-            AudioFingerprintMethod.id,
-        }
-    raise ValueError(f"Unknown preset: {preset!r}")
+def build_method(method_id: MethodId) -> ComparisonMethod:
+    return METHOD_REGISTRY[method_id]()
 
 
 __all__ = [
-    "METHOD_REGISTRY",
-    "ALL_METHOD_IDS",
     "ComparisonMethod",
-    "get_method",
-    "instantiate_methods",
-    "methods_for_preset",
+    "MethodContext",
+    "METHOD_REGISTRY",
+    "build_method",
+    "SizeMethod",
+    "Sha256Method",
+    "PartialHashMethod",
+    "MetadataMethod",
+    "PerceptualHashMethod",
+    "SsimMethod",
+    "PsnrMethod",
+    "VmafMethod",
+    "AudioFingerprintMethod",
 ]

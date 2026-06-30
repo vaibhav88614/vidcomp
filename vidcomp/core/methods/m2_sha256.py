@@ -1,4 +1,4 @@
-"""M2 — full SHA-256 hash (exact byte-identical duplicate detection)."""
+"""M2 - Full SHA-256 hash (exact byte-identical duplicate detection)."""
 
 from __future__ import annotations
 
@@ -6,44 +6,46 @@ import hashlib
 import logging
 from typing import Optional
 
-from ...config import METHOD_SHA256
-from ..models import VideoFile
+from ..models import MatchEvidence, MethodId, VideoFile
 from .base import ComparisonMethod, MethodContext
 
-LOG = logging.getLogger(__name__)
+log = logging.getLogger("vidcomp.methods.sha256")
 
-_CHUNK = 1024 * 1024  # 1 MiB read chunks
+_CHUNK = 1 << 20  # 1 MiB read chunks
+
+
+def sha256_of(path: str) -> Optional[str]:
+    """Return the hex SHA-256 of a file, or ``None`` if it cannot be read."""
+    h = hashlib.sha256()
+    try:
+        with open(path, "rb") as fh:
+            while True:
+                chunk = fh.read(_CHUNK)
+                if not chunk:
+                    break
+                h.update(chunk)
+        return h.hexdigest()
+    except OSError as exc:
+        log.debug("sha256 read failed for %s: %s", path, exc)
+        return None
 
 
 class Sha256Method(ComparisonMethod):
-    id = METHOD_SHA256
-    display_name = "SHA-256 (full file hash)"
-    kind = "signature"
-    description = "Exact byte-by-byte hash. Two files with the same SHA-256 are identical."
+    """Confirms byte-identical files via full-content SHA-256."""
 
-    def compute_signature(self, file: VideoFile, ctx: MethodContext) -> Optional[str]:
-        cached = ctx.cache.get_text(file.path, file.size, file.mtime, self.id)
-        if cached is not None:
-            return cached
-        digest = self._hash_file(file.path, ctx)
-        if digest is None:
-            return None
-        ctx.cache.put_text(file.path, file.size, file.mtime, self.id, digest)
-        return digest
+    method_id = MethodId.SHA256
 
-    @staticmethod
-    def _hash_file(path: str, ctx: MethodContext) -> Optional[str]:
-        h = hashlib.sha256()
-        try:
-            with open(path, "rb") as f:
-                while True:
-                    if ctx.is_cancelled():
-                        return None
-                    chunk = f.read(_CHUNK)
-                    if not chunk:
-                        break
-                    h.update(chunk)
-        except OSError as exc:
-            LOG.warning("SHA-256 read failed for %s: %s", path, exc)
-            return None
-        return h.hexdigest()
+    def prepare(self, vf: VideoFile, ctx: MethodContext) -> None:
+        if vf.sha256 is None:
+            vf.sha256 = sha256_of(vf.path)
+
+    def compare(
+        self, a: VideoFile, b: VideoFile, ctx: MethodContext
+    ) -> Optional[MatchEvidence]:
+        if a.sha256 and b.sha256 and a.sha256 == b.sha256:
+            return MatchEvidence(
+                method=MethodId.SHA256,
+                score=1.0,
+                detail="identical SHA-256 (byte-for-byte duplicate)",
+            )
+        return None

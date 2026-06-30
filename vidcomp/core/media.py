@@ -1,14 +1,12 @@
-"""External-tool detection and ffmpeg/ffprobe/fpcalc wrappers.
+"""Platform-isolated wrappers around external media tools.
 
-Every function that shells out:
-    * Honours an optional :class:`threading.Event` *cancel_event* so a scan can
-      be cancelled within seconds rather than waiting for ffmpeg to finish.
-    * Captures stderr separately so callers can surface useful errors.
-    * Times out generously (so a hung subprocess can't deadlock the GUI).
+All interaction with ``ffmpeg``, ``ffprobe`` and ``fpcalc`` (Chromaprint) lives
+here so the rest of the engine and the GUI never touch ``subprocess`` directly.
+Porting VidComp to another OS later should only require changes in this module.
 
-The module intentionally has no Qt dependency — it is the "platform isolation"
-layer the prompt asks for.  Today everything is ffmpeg/ffprobe/fpcalc which work
-on Windows, but a future port would only need to swap implementations here.
+On Windows we pass ``CREATE_NO_WINDOW`` so spawning tools does not flash console
+windows.  Every call has a timeout and degrades gracefully when a tool is
+missing or a file is unreadable.
 """
 
 from __future__ import annotations
@@ -16,604 +14,447 @@ from __future__ import annotations
 import json
 import logging
 import os
-import re
 import shutil
 import subprocess
+import sys
 import tempfile
-import threading
-import time
 from dataclasses import dataclass
-from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Optional
 
-import numpy as np
+from .models import MediaInfo
 
-from .models import MediaMetadata, ToolStatus, ToolsStatus
+log = logging.getLogger("vidcomp.media")
 
-LOG = logging.getLogger(__name__)
-
-# ---------------------------------------------------------------------------
-# Subprocess flags — silence the console window on Windows when packaged.
-# ---------------------------------------------------------------------------
-_CREATE_NO_WINDOW = 0x08000000 if os.name == "nt" else 0
+# Hide console windows for child processes on Windows.
+_CREATE_NO_WINDOW = 0x08000000 if sys.platform == "win32" else 0
 
 
 @dataclass
-class _ToolPaths:
-    ffmpeg: Optional[str] = None
-    ffprobe: Optional[str] = None
-    fpcalc: Optional[str] = None
+class ToolStatus:
+    """Availability of an external tool."""
+
+    name: str
+    path: Optional[str]
+    available: bool
+    has_vmaf: bool = False  # only meaningful for ffmpeg
 
 
-_paths = _ToolPaths()
-_libvmaf_available: Optional[bool] = None
-_detection_lock = threading.Lock()
-
-
-# ---------------------------------------------------------------------------
-# Tool detection
-# ---------------------------------------------------------------------------
-def _which(name: str) -> Optional[str]:
-    return shutil.which(name) or shutil.which(name + ".exe")
-
-
-def _run_capture(
-    argv: List[str],
-    timeout: float = 15.0,
-) -> Tuple[int, str, str]:
-    """Run a quick command, return (rc, stdout, stderr)."""
+def _run(
+    args: list[str],
+    timeout: float = 60.0,
+    capture: bool = True,
+) -> subprocess.CompletedProcess:
+    """Run an external command with no console window and a timeout."""
+    log.debug("exec: %s (timeout=%.1fs)", _shellish(args), timeout)
     try:
-        proc = subprocess.run(
-            argv,
-            capture_output=True,
-            text=True,
+        cp = subprocess.run(
+            args,
+            stdout=subprocess.PIPE if capture else subprocess.DEVNULL,
+            stderr=subprocess.PIPE if capture else subprocess.DEVNULL,
+            creationflags=_CREATE_NO_WINDOW,
             timeout=timeout,
-            creationflags=_CREATE_NO_WINDOW,
+            check=False,
         )
-        return proc.returncode, proc.stdout, proc.stderr
-    except (FileNotFoundError, subprocess.TimeoutExpired, OSError) as exc:
-        return 1, "", str(exc)
-
-
-def _probe_tool_version(path: str, args: List[str] = None) -> Optional[str]:
-    args = args or ["-version"]
-    rc, out, err = _run_capture([path, *args], timeout=10.0)
-    text = (out or "") + (err or "")
-    # First line typically contains the version.
-    first = text.strip().splitlines()[0] if text.strip() else ""
-    return first or None
-
-
-def detect_tools(force: bool = False) -> ToolsStatus:
-    """Probe ``ffmpeg``, ``ffprobe``, ``fpcalc`` on PATH; also detect libvmaf."""
-    global _libvmaf_available
-    with _detection_lock:
-        if not force and _paths.ffmpeg and _paths.ffprobe:
-            pass  # use cached
-        _paths.ffmpeg = _which("ffmpeg")
-        _paths.ffprobe = _which("ffprobe")
-        _paths.fpcalc = _which("fpcalc")
-
-        def _status(name: str, path: Optional[str]) -> ToolStatus:
-            if not path:
-                return ToolStatus.missing(name)
-            version = _probe_tool_version(path)
-            return ToolStatus(name=name, path=path, version=version, available=True)
-
-        ff = _status("ffmpeg", _paths.ffmpeg)
-        fp = _status("ffprobe", _paths.ffprobe)
-        ac = _status("fpcalc", _paths.fpcalc)
-
-        libvmaf = False
-        if _paths.ffmpeg:
-            rc, out, _err = _run_capture([_paths.ffmpeg, "-hide_banner", "-filters"], timeout=10.0)
-            if rc == 0 and "libvmaf" in out.lower():
-                libvmaf = True
-        _libvmaf_available = libvmaf
-
-        return ToolsStatus(ffmpeg=ff, ffprobe=fp, fpcalc=ac, libvmaf=libvmaf)
-
-
-def ffmpeg_path() -> str:
-    if not _paths.ffmpeg:
-        detect_tools()
-    if not _paths.ffmpeg:
-        raise FileNotFoundError("ffmpeg not found on PATH")
-    return _paths.ffmpeg
-
-
-def ffprobe_path() -> str:
-    if not _paths.ffprobe:
-        detect_tools()
-    if not _paths.ffprobe:
-        raise FileNotFoundError("ffprobe not found on PATH")
-    return _paths.ffprobe
-
-
-def fpcalc_path() -> Optional[str]:
-    if not _paths.fpcalc:
-        detect_tools()
-    return _paths.fpcalc
-
-
-def has_libvmaf() -> bool:
-    if _libvmaf_available is None:
-        detect_tools()
-    return bool(_libvmaf_available)
-
-
-def has_fpcalc() -> bool:
-    return fpcalc_path() is not None
-
-
-# ---------------------------------------------------------------------------
-# Cancellable subprocess
-# ---------------------------------------------------------------------------
-def _run_cancellable(
-    argv: List[str],
-    cancel_event: Optional[threading.Event] = None,
-    timeout: float = 600.0,
-    cwd: Optional[str] = None,
-) -> Tuple[int, str, str]:
-    """Run a subprocess, polling *cancel_event* every 100 ms.
-
-    On cancel the process is terminated (then killed if needed) and we return
-    ``(-1, stdout_so_far, stderr_so_far)``.
-    """
-    try:
-        proc = subprocess.Popen(
-            argv,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            cwd=cwd,
-            creationflags=_CREATE_NO_WINDOW,
+        log.debug(
+            "exec rc=%s stdout=%dB stderr=%dB (%s)",
+            cp.returncode,
+            len(cp.stdout) if cp.stdout else 0,
+            len(cp.stderr) if cp.stderr else 0,
+            os.path.basename(args[0]) if args else "?",
         )
-    except (FileNotFoundError, OSError) as exc:
-        return 1, "", str(exc)
-
-    start = time.time()
-    while True:
-        if proc.poll() is not None:
-            break
-        if cancel_event is not None and cancel_event.is_set():
-            proc.terminate()
-            try:
-                proc.wait(timeout=2.0)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-            out, err = proc.communicate()
-            return -1, _decode(out), _decode(err)
-        if time.time() - start > timeout:
-            proc.kill()
-            out, err = proc.communicate()
-            return -1, _decode(out), _decode(err)
-        time.sleep(0.1)
-
-    out, err = proc.communicate()
-    return proc.returncode, _decode(out), _decode(err)
+        return cp
+    except subprocess.TimeoutExpired as exc:
+        log.warning("exec TIMEOUT after %.1fs: %s", timeout, _shellish(args))
+        raise
+    except FileNotFoundError as exc:
+        log.warning("exec NOT FOUND: %s (%s)", args[0] if args else "?", exc)
+        raise
 
 
-def _decode(b: Optional[bytes]) -> str:
-    if not b:
-        return ""
-    try:
-        return b.decode("utf-8", errors="replace")
-    except Exception:
-        return ""
+def _shellish(args: list[str]) -> str:
+    """Shell-ish single-line representation of an arg list for logs."""
+    out = []
+    for a in args:
+        s = str(a)
+        out.append(f'"{s}"' if " " in s else s)
+    return " ".join(out)
 
 
-# ---------------------------------------------------------------------------
-# Metadata (ffprobe)
-# ---------------------------------------------------------------------------
-def probe_metadata(
-    path: str,
-    cancel_event: Optional[threading.Event] = None,
-) -> MediaMetadata:
-    """Run ffprobe and parse the JSON into a :class:`MediaMetadata`."""
-    argv = [
-        ffprobe_path(),
-        "-v", "error",
-        "-print_format", "json",
-        "-show_format",
-        "-show_streams",
-        path,
-    ]
-    rc, out, err = _run_cancellable(argv, cancel_event=cancel_event, timeout=60.0)
-    if rc != 0 or not out.strip():
-        raise RuntimeError(f"ffprobe failed for {path}: {err.strip() or 'no output'}")
-    return parse_ffprobe_json(out)
+def find_tool(name: str, extra_paths: Optional[list[str]] = None) -> Optional[str]:
+    """Locate an executable on PATH (or a few common install locations)."""
+    found = shutil.which(name)
+    if found:
+        log.debug("find_tool: %s -> %s (PATH)", name, found)
+        return found
+    # A handful of common Windows install locations as a convenience.
+    candidates: list[str] = []
+    if sys.platform == "win32":
+        exe = name if name.lower().endswith(".exe") else name + ".exe"
+        for base in (
+            os.environ.get("ProgramFiles", r"C:\Program Files"),
+            os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"),
+            os.environ.get("LOCALAPPDATA", ""),
+        ):
+            if base:
+                candidates.append(os.path.join(base, "ffmpeg", "bin", exe))
+                candidates.append(os.path.join(base, exe))
+    for c in (extra_paths or []) + candidates:
+        if c and os.path.isfile(c):
+            log.debug("find_tool: %s -> %s (candidate)", name, c)
+            return c
+    log.debug("find_tool: %s NOT FOUND (PATH=%s)", name, os.environ.get("PATH", "")[:200])
+    return None
 
 
-def parse_ffprobe_json(text: str) -> MediaMetadata:
-    """Parse ffprobe JSON output into a :class:`MediaMetadata`.
+class MediaTools:
+    """Resolves and caches the locations/capabilities of external tools."""
 
-    Exposed for unit tests so we don't need a real video on disk.
-    """
-    data = json.loads(text)
-    md = MediaMetadata(raw_json=text)
-    fmt = data.get("format", {}) or {}
-    streams = data.get("streams", []) or []
+    def __init__(self) -> None:
+        log.debug("Resolving external media tools...")
+        self.ffmpeg = find_tool("ffmpeg")
+        self.ffprobe = find_tool("ffprobe")
+        self.fpcalc = find_tool("fpcalc")
+        self._has_vmaf: Optional[bool] = None
+        log.info(
+            "MediaTools resolved: ffmpeg=%s ffprobe=%s fpcalc=%s",
+            self.ffmpeg or "MISSING",
+            self.ffprobe or "MISSING",
+            self.fpcalc or "MISSING",
+        )
 
-    duration = fmt.get("duration")
-    if duration is not None:
+    # --- availability ------------------------------------------------------
+    @property
+    def has_ffmpeg(self) -> bool:
+        return self.ffmpeg is not None
+
+    @property
+    def has_ffprobe(self) -> bool:
+        return self.ffprobe is not None
+
+    @property
+    def has_fpcalc(self) -> bool:
+        return self.fpcalc is not None
+
+    def has_vmaf(self) -> bool:
+        """True if the resolved ffmpeg build exposes the libvmaf filter."""
+        if self._has_vmaf is not None:
+            return self._has_vmaf
+        self._has_vmaf = False
+        if not self.ffmpeg:
+            return False
         try:
-            md.duration_sec = float(duration)
+            cp = _run([self.ffmpeg, "-hide_banner", "-filters"], timeout=20)
+            out = (cp.stdout or b"").decode("utf-8", "ignore")
+            self._has_vmaf = "libvmaf" in out
+        except Exception as exc:  # pragma: no cover - environment dependent
+            log.debug("vmaf probe failed: %s", exc)
+        return self._has_vmaf
+
+    def status(self) -> list[ToolStatus]:
+        return [
+            ToolStatus("ffmpeg", self.ffmpeg, self.has_ffmpeg, self.has_vmaf()),
+            ToolStatus("ffprobe", self.ffprobe, self.has_ffprobe),
+            ToolStatus("fpcalc", self.fpcalc, self.has_fpcalc),
+        ]
+
+    # --- ffprobe metadata --------------------------------------------------
+    def probe(self, path: str, timeout: float = 30.0) -> MediaInfo:
+        """Extract container/stream metadata for a file via ffprobe."""
+        info = MediaInfo()
+        if not self.ffprobe:
+            log.debug("probe skipped (no ffprobe): %s", path)
+            return info
+        log.debug("probe: %s", path)
+        try:
+            cp = _run(
+                [
+                    self.ffprobe, "-v", "error", "-print_format", "json",
+                    "-show_format", "-show_streams", path,
+                ],
+                timeout=timeout,
+            )
+            if cp.returncode != 0 or not cp.stdout:
+                return info
+            data = json.loads(cp.stdout.decode("utf-8", "ignore"))
+        except Exception as exc:
+            log.debug("ffprobe failed for %s: %s", path, exc)
+            return info
+
+        fmt = data.get("format", {})
+        try:
+            if fmt.get("duration"):
+                info.duration = float(fmt["duration"])
+            if fmt.get("bit_rate"):
+                info.bitrate = int(fmt["bit_rate"])
         except (TypeError, ValueError):
-            md.duration_sec = None
-    if "bit_rate" in fmt:
-        try:
-            md.bit_rate = int(fmt["bit_rate"])
-        except (TypeError, ValueError):
-            md.bit_rate = None
-
-    video = next((s for s in streams if s.get("codec_type") == "video"), None)
-    audio = next((s for s in streams if s.get("codec_type") == "audio"), None)
-
-    if video is not None:
-        md.has_video = True
-        md.video_codec = video.get("codec_name")
-        try:
-            md.width = int(video["width"])
-            md.height = int(video["height"])
-        except (KeyError, TypeError, ValueError):
             pass
-        fr = video.get("avg_frame_rate") or video.get("r_frame_rate")
-        md.fps = _parse_fraction(fr)
-        if md.duration_sec is None and "duration" in video:
-            try:
-                md.duration_sec = float(video["duration"])
-            except (TypeError, ValueError):
-                pass
-        if md.bit_rate is None and "bit_rate" in video:
-            try:
-                md.bit_rate = int(video["bit_rate"])
-            except (TypeError, ValueError):
-                pass
 
-    if audio is not None:
-        md.has_audio = True
-        md.audio_codec = audio.get("codec_name")
+        for stream in data.get("streams", []):
+            ctype = stream.get("codec_type")
+            if ctype == "video" and not info.has_video:
+                info.has_video = True
+                info.video_codec = stream.get("codec_name")
+                info.width = _as_int(stream.get("width"))
+                info.height = _as_int(stream.get("height"))
+                info.fps = _parse_fps(stream.get("avg_frame_rate") or stream.get("r_frame_rate"))
+                if info.duration is None and stream.get("duration"):
+                    info.duration = _as_float(stream.get("duration"))
+            elif ctype == "audio" and not info.has_audio:
+                info.has_audio = True
+                info.audio_codec = stream.get("codec_name")
+                info.audio_channels = _as_int(stream.get("channels"))
+
+        info.ok = info.has_video or info.has_audio or info.duration is not None
+        log.debug(
+            "probe -> ok=%s dur=%s res=%sx%s codec=%s fps=%s",
+            info.ok, info.duration, info.width, info.height, info.video_codec, info.fps,
+        )
+        return info
+
+    # --- frame extraction --------------------------------------------------
+    def extract_frames(
+        self,
+        path: str,
+        count: int,
+        duration: Optional[float],
+        out_dir: str,
+        size: int = 256,
+        timeout: float = 120.0,
+    ) -> list[str]:
+        """Extract ``count`` evenly-spaced frames as JPEGs into ``out_dir``.
+
+        Returns the list of frame file paths actually produced (may be shorter
+        than ``count`` for short/odd files).
+        """
+        if not self.ffmpeg or count <= 0:
+            return []
+        os.makedirs(out_dir, exist_ok=True)
+        produced: list[str] = []
+
+        # When we know the duration, grab frames at fixed timestamps; this is
+        # robust for files where the 'select' filter would be unpredictable.
+        if duration and duration > 0:
+            # Avoid the very first/last instants which are often black.
+            margin = min(1.0, duration * 0.05)
+            usable = max(duration - 2 * margin, 0.0)
+            for i in range(count):
+                frac = (i + 0.5) / count
+                ts = margin + usable * frac
+                out = os.path.join(out_dir, f"frame_{i:03d}.jpg")
+                try:
+                    cp = _run(
+                        [
+                            self.ffmpeg, "-hide_banner", "-loglevel", "error",
+                            "-ss", f"{ts:.3f}", "-i", path, "-frames:v", "1",
+                            "-vf", f"scale={size}:-1", "-q:v", "3", "-y", out,
+                        ],
+                        timeout=timeout,
+                    )
+                    if cp.returncode == 0 and os.path.isfile(out) and os.path.getsize(out) > 0:
+                        produced.append(out)
+                except Exception as exc:
+                    log.debug("frame extract failed (%s @ %.2fs): %s", path, ts, exc)
+            return produced
+
+        # Unknown duration: ask ffmpeg for the first N frames at a low fps.
+        pattern = os.path.join(out_dir, "frame_%03d.jpg")
         try:
-            md.audio_channels = int(audio.get("channels", 0)) or None
-        except (TypeError, ValueError):
-            pass
-        try:
-            md.audio_sample_rate = int(audio.get("sample_rate", 0)) or None
-        except (TypeError, ValueError):
-            pass
+            _run(
+                [
+                    self.ffmpeg, "-hide_banner", "-loglevel", "error", "-i", path,
+                    "-vf", f"fps=1,scale={size}:-1", "-frames:v", str(count),
+                    "-q:v", "3", "-y", pattern,
+                ],
+                timeout=timeout,
+            )
+        except Exception as exc:
+            log.debug("sequential frame extract failed (%s): %s", path, exc)
+        for i in range(1, count + 1):
+            out = os.path.join(out_dir, f"frame_{i:03d}.jpg")
+            if os.path.isfile(out) and os.path.getsize(out) > 0:
+                produced.append(out)
+        return produced
 
-    return md
-
-
-def _parse_fraction(value: Optional[str]) -> Optional[float]:
-    if not value or value == "0/0":
-        return None
-    if "/" in value:
-        try:
-            num, denom = value.split("/", 1)
-            num_f = float(num)
-            denom_f = float(denom)
-            if denom_f == 0:
-                return None
-            return num_f / denom_f
-        except (ValueError, ZeroDivisionError):
+    def extract_thumbnail(
+        self,
+        path: str,
+        out_path: str,
+        duration: Optional[float],
+        size: int = 320,
+        timeout: float = 60.0,
+    ) -> Optional[str]:
+        """Extract a single representative frame to ``out_path`` (JPEG)."""
+        if not self.ffmpeg:
             return None
-    try:
-        return float(value)
-    except ValueError:
+        ts = 1.0
+        if duration and duration > 0:
+            ts = max(0.0, min(duration * 0.25, duration - 0.1))
+        os.makedirs(os.path.dirname(out_path), exist_ok=True)
+        try:
+            cp = _run(
+                [
+                    self.ffmpeg, "-hide_banner", "-loglevel", "error",
+                    "-ss", f"{ts:.3f}", "-i", path, "-frames:v", "1",
+                    "-vf", f"scale={size}:-1", "-q:v", "3", "-y", out_path,
+                ],
+                timeout=timeout,
+            )
+            if cp.returncode == 0 and os.path.isfile(out_path) and os.path.getsize(out_path) > 0:
+                return out_path
+        except Exception as exc:
+            log.debug("thumbnail extract failed (%s): %s", path, exc)
         return None
 
+    # --- SSIM / PSNR via lavfi --------------------------------------------
+    def ssim_psnr(
+        self,
+        ref: str,
+        cmp: str,
+        timeout: float = 180.0,
+    ) -> tuple[Optional[float], Optional[float]]:
+        """Compute average SSIM (0..1) and PSNR (dB) between two videos.
 
-# ---------------------------------------------------------------------------
-# Frame extraction
-# ---------------------------------------------------------------------------
-def extract_frames_to_dir(
-    path: str,
-    timestamps_sec: List[float],
-    out_dir: Path,
-    cancel_event: Optional[threading.Event] = None,
-    size: Tuple[int, int] = (320, 180),
-) -> List[Path]:
-    """Extract one frame per timestamp into *out_dir* as PNG.
+        Both inputs are scaled to a common small resolution and compared frame
+        for frame.  Returns ``(None, None)`` if ffmpeg is missing or fails.
+        """
+        if not self.ffmpeg:
+            return (None, None)
+        # ffmpeg's ssim/psnr filters each print their own summary to stderr, so
+        # we run them separately for reliable parsing. Both inputs are scaled to
+        # a common small resolution and a low fps to keep the comparison fast.
+        ssim = self._single_metric(ref, cmp, "ssim", timeout)
+        psnr = self._single_metric(ref, cmp, "psnr", timeout)
+        return (ssim, psnr)
 
-    Returns the list of paths actually produced (some timestamps may fail on
-    very short files); never raises for an individual failure.
-    """
-    out_dir.mkdir(parents=True, exist_ok=True)
-    out_files: List[Path] = []
-    width, height = size
-    for i, ts in enumerate(timestamps_sec):
-        if cancel_event is not None and cancel_event.is_set():
-            break
-        target = out_dir / f"frame_{i:03d}.png"
-        argv = [
-            ffmpeg_path(),
-            "-y",
-            "-ss", f"{max(0.0, ts):.3f}",
-            "-i", path,
-            "-frames:v", "1",
-            "-vf", f"scale={width}:{height}:force_original_aspect_ratio=decrease,"
-                   f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=black",
-            "-q:v", "3",
-            str(target),
-        ]
-        rc, _out, err = _run_cancellable(argv, cancel_event=cancel_event, timeout=60.0)
-        if rc == 0 and target.exists():
-            out_files.append(target)
-        else:
-            LOG.debug("frame extract failed for %s @ %.3fs: %s", path, ts, err.strip())
-    return out_files
-
-
-def extract_single_frame(
-    path: str,
-    timestamp_sec: float,
-    out_file: Path,
-    cancel_event: Optional[threading.Event] = None,
-    size: Tuple[int, int] = (320, 180),
-) -> bool:
-    """Extract one frame to *out_file*; return True on success."""
-    out_file.parent.mkdir(parents=True, exist_ok=True)
-    width, height = size
-    argv = [
-        ffmpeg_path(),
-        "-y",
-        "-ss", f"{max(0.0, timestamp_sec):.3f}",
-        "-i", path,
-        "-frames:v", "1",
-        "-vf", f"scale={width}:{height}:force_original_aspect_ratio=decrease,"
-               f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=black",
-        "-q:v", "3",
-        str(out_file),
-    ]
-    rc, _out, _err = _run_cancellable(argv, cancel_event=cancel_event, timeout=60.0)
-    return rc == 0 and out_file.exists()
-
-
-def compute_uniform_timestamps(duration_sec: float, count: int) -> List[float]:
-    """Pick ``count`` timestamps inside ``[0, duration_sec)`` spaced uniformly.
-
-    The first and last frames are skipped to avoid black-screen artefacts.
-    """
-    if count <= 0:
-        return []
-    if duration_sec <= 0:
-        return [0.0] * count
-    # Place samples at i / (count + 1) of duration for inner placement.
-    return [duration_sec * (i + 1) / (count + 1) for i in range(count)]
-
-
-# ---------------------------------------------------------------------------
-# SSIM / PSNR / VMAF via ffmpeg lavfi
-# ---------------------------------------------------------------------------
-_SSIM_RE = re.compile(r"All:\s*([0-9.]+)")
-_PSNR_RE = re.compile(r"average:\s*([0-9.]+)")
-_VMAF_RE = re.compile(r"VMAF score:\s*([0-9.]+)", re.IGNORECASE)
-_VMAF_JSON_RE = re.compile(r'"VMAF score"\s*:\s*([0-9.]+)')
-
-
-def _common_duration(a_dur: Optional[float], b_dur: Optional[float]) -> Optional[float]:
-    if a_dur is None or b_dur is None:
-        return None
-    d = min(a_dur, b_dur)
-    return d if d > 0 else None
-
-
-def run_ssim(
-    path_a: str,
-    path_b: str,
-    duration_a: Optional[float] = None,
-    duration_b: Optional[float] = None,
-    target_size: Tuple[int, int] = (320, 180),
-    cancel_event: Optional[threading.Event] = None,
-) -> Optional[float]:
-    """Return SSIM (0..1) between two videos, or ``None`` on failure."""
-    dur = _common_duration(duration_a, duration_b)
-    width, height = target_size
-    vf = (
-        f"[0:v]scale={width}:{height},setpts=PTS-STARTPTS[a];"
-        f"[1:v]scale={width}:{height},setpts=PTS-STARTPTS[b];"
-        f"[a][b]ssim"
-    )
-    argv = [
-        ffmpeg_path(),
-        "-hide_banner",
-        "-nostats",
-        "-i", path_a,
-        "-i", path_b,
-        "-lavfi", vf,
-        "-an",
-    ]
-    if dur is not None:
-        argv += ["-t", f"{dur:.3f}"]
-    argv += ["-f", "null", "-"]
-    rc, _out, err = _run_cancellable(argv, cancel_event=cancel_event, timeout=600.0)
-    if rc != 0:
-        return None
-    return _last_float(_SSIM_RE.findall(err))
-
-
-def run_psnr(
-    path_a: str,
-    path_b: str,
-    duration_a: Optional[float] = None,
-    duration_b: Optional[float] = None,
-    target_size: Tuple[int, int] = (320, 180),
-    cancel_event: Optional[threading.Event] = None,
-) -> Optional[float]:
-    """Return PSNR in dB between two videos, or ``None`` on failure.
-
-    ``inf`` is returned by ffmpeg for identical inputs; we map that to a large
-    finite value (200.0) so callers can compare numerically.
-    """
-    dur = _common_duration(duration_a, duration_b)
-    width, height = target_size
-    vf = (
-        f"[0:v]scale={width}:{height},setpts=PTS-STARTPTS[a];"
-        f"[1:v]scale={width}:{height},setpts=PTS-STARTPTS[b];"
-        f"[a][b]psnr"
-    )
-    argv = [
-        ffmpeg_path(),
-        "-hide_banner",
-        "-nostats",
-        "-i", path_a,
-        "-i", path_b,
-        "-lavfi", vf,
-        "-an",
-    ]
-    if dur is not None:
-        argv += ["-t", f"{dur:.3f}"]
-    argv += ["-f", "null", "-"]
-    rc, _out, err = _run_cancellable(argv, cancel_event=cancel_event, timeout=600.0)
-    if rc != 0:
-        return None
-    # ffmpeg prints `PSNR ... average:NN.NN ...` and may print `inf`
-    if "average:inf" in err:
-        return 200.0
-    return _last_float(_PSNR_RE.findall(err))
-
-
-def run_vmaf(
-    path_a: str,
-    path_b: str,
-    duration_a: Optional[float] = None,
-    duration_b: Optional[float] = None,
-    target_size: Tuple[int, int] = (320, 180),
-    cancel_event: Optional[threading.Event] = None,
-) -> Optional[float]:
-    """Return VMAF (0..100) between two videos, or ``None`` if unsupported/failed."""
-    if not has_libvmaf():
-        return None
-    dur = _common_duration(duration_a, duration_b)
-    width, height = target_size
-
-    # Use a temp log file so we can parse a deterministic JSON output.
-    with tempfile.TemporaryDirectory(prefix="vidcomp_vmaf_") as tmp:
-        log_path = Path(tmp) / "vmaf.json"
-        # ffmpeg parses ":" in filter args; use forward slashes on Windows.
-        log_arg = str(log_path).replace("\\", "/")
-        vf = (
-            f"[0:v]scale={width}:{height},setpts=PTS-STARTPTS[a];"
-            f"[1:v]scale={width}:{height},setpts=PTS-STARTPTS[b];"
-            f"[a][b]libvmaf=log_fmt=json:log_path={log_arg}"
+    def _single_metric(
+        self, ref: str, cmp: str, metric: str, timeout: float
+    ) -> Optional[float]:
+        flt = (
+            f"[0:v]scale=320:180:flags=bilinear,setsar=1,fps=2[a];"
+            f"[1:v]scale=320:180:flags=bilinear,setsar=1,fps=2[b];"
+            f"[a][b]{metric}"
         )
-        argv = [
-            ffmpeg_path(),
-            "-hide_banner",
-            "-nostats",
-            "-i", path_a,
-            "-i", path_b,
-            "-lavfi", vf,
-            "-an",
-        ]
-        if dur is not None:
-            argv += ["-t", f"{dur:.3f}"]
-        argv += ["-f", "null", "-"]
-        rc, _out, err = _run_cancellable(argv, cancel_event=cancel_event, timeout=900.0)
-        if rc != 0:
+        try:
+            cp = _run(
+                [
+                    self.ffmpeg, "-hide_banner", "-loglevel", "info",
+                    "-i", ref, "-i", cmp,
+                    "-filter_complex", flt, "-an", "-f", "null", os.devnull,
+                ],
+                timeout=timeout,
+            )
+            err = (cp.stderr or b"").decode("utf-8", "ignore")
+            return _parse_metric(err, metric)
+        except Exception as exc:
+            log.debug("%s failed (%s vs %s): %s", metric, ref, cmp, exc)
             return None
 
-        if log_path.exists():
+    # --- VMAF --------------------------------------------------------------
+    def vmaf(self, ref: str, cmp: str, timeout: float = 300.0) -> Optional[float]:
+        """Compute the mean VMAF score (0..100) if libvmaf is available."""
+        if not self.ffmpeg or not self.has_vmaf():
+            return None
+        flt = (
+            "[0:v]scale=640:360:flags=bilinear,setsar=1,fps=5[a];"
+            "[1:v]scale=640:360:flags=bilinear,setsar=1,fps=5[b];"
+            "[b][a]libvmaf=log_fmt=json"
+        )
+        with tempfile.TemporaryDirectory(prefix="vidcomp_vmaf_") as tmp:
+            log_path = os.path.join(tmp, "vmaf.json")
+            flt_logged = flt.replace(
+                "libvmaf=log_fmt=json",
+                f"libvmaf=log_fmt=json:log_path={log_path.replace(os.sep, '/')}",
+            )
             try:
-                data = json.loads(log_path.read_text(encoding="utf-8"))
-                pooled = data.get("pooled_metrics", {}).get("vmaf", {})
-                mean = pooled.get("mean")
-                if mean is not None:
-                    return float(mean)
-            except (OSError, json.JSONDecodeError):
-                pass
-
-        # Fall back to scraping stderr.
-        m = _VMAF_RE.search(err) or _VMAF_JSON_RE.search(err)
-        if m:
-            try:
-                return float(m.group(1))
-            except ValueError:
-                return None
+                _run(
+                    [
+                        self.ffmpeg, "-hide_banner", "-loglevel", "error",
+                        "-i", cmp, "-i", ref,
+                        "-filter_complex", flt_logged, "-an", "-f", "null", os.devnull,
+                    ],
+                    timeout=timeout,
+                )
+                if os.path.isfile(log_path):
+                    with open(log_path, "r", encoding="utf-8") as fh:
+                        data = json.load(fh)
+                    pooled = data.get("pooled_metrics", {}).get("vmaf", {})
+                    if "mean" in pooled:
+                        return float(pooled["mean"])
+                    if data.get("frames"):
+                        vals = [f["metrics"]["vmaf"] for f in data["frames"] if "metrics" in f]
+                        if vals:
+                            return sum(vals) / len(vals)
+            except Exception as exc:
+                log.debug("vmaf failed (%s vs %s): %s", ref, cmp, exc)
         return None
 
+    # --- Chromaprint audio fingerprint ------------------------------------
+    def fingerprint(self, path: str, timeout: float = 120.0) -> tuple[Optional[str], Optional[float]]:
+        """Return (raw fingerprint, duration) from fpcalc, or (None, None).
 
-def _last_float(values: List[str]) -> Optional[float]:
-    if not values:
-        return None
+        The raw fingerprint is a comma-separated list of 32-bit integers, which
+        is what we need for bit-level similarity comparison (the default
+        base64-compressed form cannot be compared directly).
+        """
+        if not self.fpcalc:
+            return (None, None)
+        try:
+            cp = _run([self.fpcalc, "-raw", "-json", path], timeout=timeout)
+            if cp.returncode == 0 and cp.stdout:
+                data = json.loads(cp.stdout.decode("utf-8", "ignore"))
+                fp = data.get("fingerprint")
+                if isinstance(fp, list):
+                    fp = ",".join(str(int(x)) for x in fp)
+                return (fp, _as_float(data.get("duration")))
+        except Exception as exc:
+            log.debug("fpcalc failed (%s): %s", path, exc)
+        return (None, None)
+
+
+# --- parsing helpers -------------------------------------------------------
+
+def _as_int(v: object) -> Optional[int]:
     try:
-        return float(values[-1])
-    except ValueError:
-        return None
-
-
-# ---------------------------------------------------------------------------
-# Chromaprint audio fingerprint
-# ---------------------------------------------------------------------------
-def audio_fingerprint(
-    path: str,
-    length_sec: int = 120,
-    cancel_event: Optional[threading.Event] = None,
-) -> Optional[Tuple[int, List[int]]]:
-    """Return ``(duration_sec, raw_fingerprint_ints)`` or None on failure/missing tool."""
-    fp = fpcalc_path()
-    if not fp:
-        return None
-    argv = [fp, "-raw", "-json", "-length", str(length_sec), path]
-    rc, out, _err = _run_cancellable(argv, cancel_event=cancel_event, timeout=180.0)
-    if rc != 0 or not out.strip():
-        return None
-    try:
-        data = json.loads(out)
-    except json.JSONDecodeError:
-        return None
-    fingerprint = data.get("fingerprint")
-    duration = data.get("duration")
-    if not isinstance(fingerprint, list) or not fingerprint:
-        return None
-    try:
-        return int(duration or 0), [int(x) for x in fingerprint]
+        return int(v)  # type: ignore[arg-type]
     except (TypeError, ValueError):
         return None
 
 
-def fingerprint_similarity(fp_a: List[int], fp_b: List[int]) -> float:
-    """Sliding-window cross-correlation of two raw Chromaprint fingerprints.
-
-    Returns a similarity in ``[0.0, 1.0]``.  Each fingerprint integer holds 32
-    bits; we use bit-wise XOR + popcount and compute ``1 - hamming / total_bits``
-    over the best alignment within a bounded window.
-    """
-    if not fp_a or not fp_b:
-        return 0.0
-    a = np.asarray(fp_a, dtype=np.uint32)
-    b = np.asarray(fp_b, dtype=np.uint32)
-    # Bound the offset search to keep this fast for long fingerprints.
-    max_offset = min(40, min(len(a), len(b)) - 1)
-    best = 0.0
-    for offset in range(-max_offset, max_offset + 1):
-        if offset >= 0:
-            x = a[offset:]
-            y = b[: len(x)]
-        else:
-            y = b[-offset:]
-            x = a[: len(y)]
-        n = min(len(x), len(y))
-        if n < 8:
-            continue
-        x = x[:n]
-        y = y[:n]
-        xor = np.bitwise_xor(x, y)
-        # popcount on uint32 array via numpy
-        bits = _popcount32(xor)
-        hamming = int(bits.sum())
-        total = n * 32
-        sim = 1.0 - hamming / total
-        if sim > best:
-            best = sim
-    return float(best)
+def _as_float(v: object) -> Optional[float]:
+    try:
+        return float(v)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
 
 
-def _popcount32(arr: np.ndarray) -> np.ndarray:
-    """Vectorised population count for an array of uint32 values."""
-    a = arr.astype(np.uint32)
-    a = a - ((a >> np.uint32(1)) & np.uint32(0x55555555))
-    a = (a & np.uint32(0x33333333)) + ((a >> np.uint32(2)) & np.uint32(0x33333333))
-    a = (a + (a >> np.uint32(4))) & np.uint32(0x0F0F0F0F)
-    return (a * np.uint32(0x01010101)) >> np.uint32(24)
+def _parse_fps(rate: Optional[str]) -> Optional[float]:
+    if not rate:
+        return None
+    try:
+        if "/" in rate:
+            num, den = rate.split("/", 1)
+            den_f = float(den)
+            return float(num) / den_f if den_f else None
+        return float(rate)
+    except (ValueError, ZeroDivisionError):
+        return None
+
+
+def _parse_metric(stderr: str, metric: str) -> Optional[float]:
+    """Parse the average SSIM/PSNR value from ffmpeg's stderr output."""
+    import re
+
+    if metric == "ssim":
+        # e.g. "SSIM ... All:0.987654 (19.1)"
+        m = re.search(r"SSIM.*?All:([0-9.]+)", stderr)
+        if m:
+            return _as_float(m.group(1))
+    elif metric == "psnr":
+        # e.g. "PSNR ... average:34.56 ..."
+        m = re.search(r"PSNR.*?average:([0-9.]+|inf)", stderr)
+        if m:
+            val = m.group(1)
+            if val == "inf":
+                return float("inf")
+            return _as_float(val)
+    return None

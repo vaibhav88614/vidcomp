@@ -1,8 +1,8 @@
-"""File deletion: Recycle Bin, quarantine folder, permanent.
+"""Safe deletion of duplicate files.
 
-The :func:`delete_files` entry point enforces the "at least one survivor per
-group" invariant by accepting a *protected* set of paths the caller must
-preserve.
+Supports three modes: Recycle Bin (reversible), move to a quarantine folder,
+and permanent delete.  A safety check guarantees that at least one file in each
+duplicate group always survives, regardless of what the caller requests.
 """
 
 from __future__ import annotations
@@ -10,174 +10,119 @@ from __future__ import annotations
 import logging
 import os
 import shutil
-from pathlib import Path
-from typing import Callable, Iterable, List, Optional, Set
+from typing import Iterable, Optional
+
+from .models import DeleteMode, DeletionResult, DuplicateGroup
+
+log = logging.getLogger("vidcomp.deletion")
 
 try:
-    from send2trash import send2trash
-except Exception:  # pragma: no cover
-    send2trash = None  # type: ignore
+    from send2trash import send2trash  # type: ignore
 
-from ..config import DELETE_PERMANENT, DELETE_QUARANTINE, DELETE_RECYCLE
-from .models import DeletionReport, DeletionResult
-
-LOG = logging.getLogger(__name__)
+    _HAVE_SEND2TRASH = True
+except Exception:  # pragma: no cover - import guard
+    _HAVE_SEND2TRASH = False
 
 
-class DeletionError(Exception):
-    """Raised when the caller violates a deletion invariant (e.g. would empty a group)."""
+class SurvivorViolation(Exception):
+    """Raised when a deletion request would wipe out an entire group."""
 
 
-def delete_files(
-    paths: Iterable[str],
-    mode: str,
-    protected_paths: Set[str],
-    quarantine_root: Optional[str] = None,
-    progress_cb: Optional[Callable[[int, int, str], None]] = None,
-) -> DeletionReport:
-    """Delete *paths* using *mode*; abort if any path is in *protected_paths*.
+def enforce_survivors(
+    selected_paths: Iterable[str], groups: Iterable[DuplicateGroup]
+) -> list[str]:
+    """Validate that no group would lose all of its files.
 
-    Parameters
-    ----------
-    paths:
-        Files to delete.
-    mode:
-        ``recycle``, ``quarantine`` or ``permanent``.
-    protected_paths:
-        Paths that must never be deleted — typically the union of each group's
-        keeper.  If any path in *paths* appears here, :class:`DeletionError` is
-        raised before any file is touched.
-    quarantine_root:
-        Destination root for quarantine mode (required if ``mode='quarantine'``).
-    progress_cb:
-        Optional ``(done, total, current_path)`` callback for the GUI.
+    Returns the (deduplicated) list of paths cleared for deletion.  Raises
+    :class:`SurvivorViolation` listing offending groups if any group has every
+    member selected.
     """
-    paths = list(paths)
-    if not paths:
-        return DeletionReport(mode=mode)
-
-    # Guard against the "delete every file in a group" footgun.
-    bad = [p for p in paths if p in protected_paths]
-    if bad:
-        raise DeletionError(
-            f"Refusing to delete {len(bad)} protected file(s); "
-            f"at least one file per group must be kept. "
-            f"First offender: {bad[0]}"
+    selected = set(selected_paths)
+    offending: list[str] = []
+    for i, g in enumerate(groups, start=1):
+        group_paths = {f.path for f in g.files}
+        if group_paths and group_paths.issubset(selected):
+            survivors = group_paths - selected
+            if not survivors:
+                offending.append(f"group #{i} ({len(group_paths)} files)")
+    if offending:
+        raise SurvivorViolation(
+            "Refusing to delete every file in: " + ", ".join(offending)
         )
-
-    if mode == DELETE_QUARANTINE and not quarantine_root:
-        raise DeletionError("quarantine_root is required for quarantine mode")
-
-    report = DeletionReport(mode=mode)
-    total = len(paths)
-    for i, p in enumerate(paths, 1):
-        if progress_cb is not None:
-            try:
-                progress_cb(i - 1, total, p)
-            except Exception:  # noqa: BLE001
-                pass
-        # Capture size *before* attempting deletion (file is gone afterwards).
-        size_before = _safe_size_before(p)
-        result = _delete_one(p, mode, quarantine_root)
-        report.results.append(result)
-        if result.ok:
-            report.bytes_reclaimed += size_before
-    if progress_cb is not None:
-        try:
-            progress_cb(total, total, "")
-        except Exception:  # noqa: BLE001
-            pass
-    return report
+    return sorted(selected)
 
 
-# ---------------------------------------------------------------------------
-def _delete_one(path: str, mode: str, quarantine_root: Optional[str]) -> DeletionResult:
+def _quarantine_destination(path: str, quarantine_root: str) -> str:
+    """Compute a collision-free destination preserving the drive/relative path."""
+    drive, rest = os.path.splitdrive(path)
+    drive_token = drive.replace(":", "").replace("\\", "").replace("/", "") or "root"
+    rel = rest.lstrip("\\/")
+    dest = os.path.join(quarantine_root, drive_token, rel)
+    base, ext = os.path.splitext(dest)
+    candidate = dest
+    n = 1
+    while os.path.exists(candidate):
+        candidate = f"{base}__{n}{ext}"
+        n += 1
+    return candidate
+
+
+def delete_path(
+    path: str,
+    mode: DeleteMode,
+    quarantine_root: Optional[str] = None,
+) -> DeletionResult:
+    """Delete a single file according to ``mode``."""
+    log.debug("delete_path mode=%s quarantine=%s path=%s", mode.value, quarantine_root, path)
     if not os.path.exists(path):
-        return DeletionResult(path=path, ok=False, error="file does not exist")
+        log.warning("delete: file vanished before deletion: %s", path)
+        return DeletionResult(path, False, mode, error="file no longer exists")
     try:
-        if mode == DELETE_RECYCLE:
-            return _to_recycle_bin(path)
-        if mode == DELETE_QUARANTINE:
-            return _to_quarantine(path, quarantine_root or "")
-        if mode == DELETE_PERMANENT:
-            return _permanent(path)
-        return DeletionResult(path=path, ok=False, error=f"unknown mode: {mode}")
-    except Exception as exc:  # noqa: BLE001
-        return DeletionResult(path=path, ok=False, error=str(exc))
+        if mode == DeleteMode.RECYCLE_BIN:
+            if not _HAVE_SEND2TRASH:
+                return DeletionResult(
+                    path, False, mode,
+                    error="send2trash not installed; cannot use Recycle Bin",
+                )
+            send2trash(os.path.abspath(path))
+            log.info("delete: recycled %s", path)
+            return DeletionResult(path, True, mode)
 
+        if mode == DeleteMode.QUARANTINE:
+            if not quarantine_root:
+                return DeletionResult(path, False, mode, error="no quarantine folder set")
+            dest = _quarantine_destination(path, quarantine_root)
+            os.makedirs(os.path.dirname(dest), exist_ok=True)
+            shutil.move(path, dest)
+            log.info("delete: quarantined %s -> %s", path, dest)
+            return DeletionResult(path, True, mode, destination=dest)
 
-def _to_recycle_bin(path: str) -> DeletionResult:
-    if send2trash is None:
-        return DeletionResult(path=path, ok=False, error="send2trash not installed")
-    try:
-        send2trash(path)
-    except Exception as exc:  # noqa: BLE001
-        return DeletionResult(path=path, ok=False, error=str(exc))
-    return DeletionResult(path=path, ok=True, target="Recycle Bin")
+        if mode == DeleteMode.PERMANENT:
+            os.remove(path)
+            log.info("delete: PERMANENTLY removed %s", path)
+            return DeletionResult(path, True, mode)
 
-
-def _to_quarantine(path: str, root: str) -> DeletionResult:
-    if not root:
-        return DeletionResult(path=path, ok=False, error="no quarantine folder set")
-    src = Path(path)
-    dest_root = Path(root)
-    dest_root.mkdir(parents=True, exist_ok=True)
-    # Preserve some structure: drive letter + path tail.
-    rel_tail = _safe_rel_tail(src)
-    dest = dest_root / rel_tail
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    dest = _ensure_unique(dest)
-    try:
-        shutil.move(str(src), str(dest))
-    except Exception as exc:  # noqa: BLE001
-        return DeletionResult(path=path, ok=False, error=str(exc))
-    return DeletionResult(path=path, ok=True, target=str(dest))
-
-
-def _permanent(path: str) -> DeletionResult:
-    try:
-        os.remove(path)
+        return DeletionResult(path, False, mode, error=f"unknown mode {mode}")
+    except PermissionError as exc:
+        return DeletionResult(path, False, mode, error=f"permission denied / file in use: {exc}")
     except OSError as exc:
-        return DeletionResult(path=path, ok=False, error=str(exc))
-    return DeletionResult(path=path, ok=True, target=None)
+        return DeletionResult(path, False, mode, error=str(exc))
 
 
-def _safe_rel_tail(src: Path) -> Path:
-    """Build a relative quarantine sub-path that preserves enough of the source."""
-    try:
-        anchor = src.anchor  # 'C:\\' on Windows
-        rest = str(src)[len(anchor):]
-        rest = rest.replace(":", "_")  # paranoia
-        return Path(anchor.replace("\\", "").replace(":", "")) / rest
-    except Exception:  # noqa: BLE001
-        return Path(src.name)
-
-
-def _ensure_unique(dest: Path) -> Path:
-    if not dest.exists():
-        return dest
-    stem = dest.stem
-    suffix = dest.suffix
-    parent = dest.parent
-    i = 1
-    while True:
-        candidate = parent / f"{stem} ({i}){suffix}"
-        if not candidate.exists():
-            return candidate
-        i += 1
-
-
-def _safe_size_before(path: str) -> int:
-    try:
-        return os.path.getsize(path)
-    except OSError:
-        return 0
-
-
-def collect_protected_paths(groups) -> Set[str]:
-    """Helper for the GUI: collect every keeper across all groups."""
-    out: Set[str] = set()
-    for g in groups:
-        if g.keeper_path:
-            out.add(g.keeper_path)
-    return out
+def delete_paths(
+    paths: Iterable[str],
+    mode: DeleteMode,
+    quarantine_root: Optional[str] = None,
+    groups: Optional[Iterable[DuplicateGroup]] = None,
+) -> list[DeletionResult]:
+    """Delete many files, optionally enforcing the per-group survivor rule."""
+    path_list = list(paths)
+    if groups is not None:
+        path_list = enforce_survivors(path_list, list(groups))
+    results: list[DeletionResult] = []
+    for p in path_list:
+        res = delete_path(p, mode, quarantine_root)
+        if not res.success:
+            log.warning("delete failed for %s: %s", p, res.error)
+        results.append(res)
+    return results

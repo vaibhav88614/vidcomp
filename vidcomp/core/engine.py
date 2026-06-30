@@ -1,631 +1,399 @@
-"""End-to-end scan engine: discovery → signatures → pair evaluation → grouping.
+"""Scan orchestration: prepare signatures, generate candidates, group matches.
 
-Stages
-------
-A. **Discovery** — scan the folder, drop files smaller than ``min_file_size``
-   and (later) shorter than ``min_duration_sec``.
-B. **Signature computation** — for every enabled signature-style method,
-   compute the per-file signature in parallel via a ``ThreadPoolExecutor``.
-C. **Candidate pair generation** — bucket files by their cheapest enabled
-   signature (file size, then metadata, then "all-pairs" fallback if neither
-   is enabled).  Pairs are deduped and capped per bucket via
-   ``max_pairs_per_bucket``.
-D. **Pair evaluation** — for every candidate pair, call ``evaluate_pair`` on
-   every enabled method (exact-signature, approximate-signature, or pairwise).
-   Pair-wise expensive methods (SSIM/PSNR/VMAF) short-circuit early when
-   ``match_logic="all"`` and a cheaper method has already disagreed.
-E. **Combination** — apply ANY / ALL logic to produce final matched pairs.
-F. **Grouping** — union-find over matched pairs into :class:`DuplicateGroup`.
-G. **Keep-rule** — mark the recommended keeper per group.
+The engine follows the performance rule from the spec: run cheap filters first
+(size -> metadata/hash -> perceptual hash) and only escalate to expensive
+pairwise metrics (SSIM/PSNR/VMAF/audio) on surviving candidate pairs.
+
+It is fully GUI-independent and communicates progress/log/error purely through
+callbacks, so it can be driven from a worker thread or a headless script.
 """
 
 from __future__ import annotations
 
+import itertools
 import logging
-import threading
-import time
-from collections import defaultdict
-from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
+import os
+import shutil
+import tempfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
-from itertools import combinations
-from pathlib import Path
-from typing import (
-    Any,
-    Callable,
-    Dict,
-    Iterable,
-    List,
-    Optional,
-    Sequence,
-    Set,
-    Tuple,
-)
+from typing import Callable, Optional
 
-from ..config import (
-    AppConfig,
-    MATCH_ALL,
-    MATCH_ANY,
-    METHOD_AUDIO,
-    METHOD_METADATA,
-    METHOD_PARTIAL_HASH,
-    METHOD_PHASH,
-    METHOD_PSNR,
-    METHOD_SHA256,
-    METHOD_SIZE,
-    METHOD_SSIM,
-    METHOD_VMAF,
-)
-from . import grouping, keep_rules, media, scanner
-from .cache import Cache
-from .methods import METHOD_REGISTRY, instantiate_methods
-from .methods.base import ComparisonMethod, MethodContext
+from ..config import ScanOptions
+from .cache import SignatureCache
+from .media import MediaTools
+from .methods import build_method
+from .methods.base import MethodContext
 from .models import (
     DuplicateGroup,
     MatchEvidence,
-    MediaMetadata,
-    PairResult,
-    ScanProgress,
+    MatchLogic,
+    MethodId,
     VideoFile,
 )
 
-LOG = logging.getLogger(__name__)
+log = logging.getLogger("vidcomp.engine")
+
+# Callback signatures.
+ProgressCb = Callable[[int, int, str], None]   # (done, total, message)
+LogCb = Callable[[str], None]
+ErrorCb = Callable[[str, str], None]            # (path, message)
+
+# Methods that are cheap signature/bucketing comparisons.
+_CHEAP = {MethodId.SIZE, MethodId.SHA256, MethodId.PARTIAL_HASH, MethodId.METADATA, MethodId.PHASH}
+_EXPENSIVE = {MethodId.SSIM, MethodId.PSNR, MethodId.VMAF, MethodId.AUDIO}
+
+# Above this many files we avoid the all-pairs fallback to stay tractable.
+_ALL_PAIRS_CAP = 2500
 
 
-# Cheapest → most expensive (defines short-circuit order in ALL mode).
-_METHOD_COST_ORDER: Sequence[str] = (
-    METHOD_SIZE,
-    METHOD_PARTIAL_HASH,
-    METHOD_METADATA,
-    METHOD_SHA256,
-    METHOD_PHASH,
-    METHOD_AUDIO,
-    METHOD_PSNR,
-    METHOD_SSIM,
-    METHOD_VMAF,
-)
+class _UnionFind:
+    def __init__(self, n: int) -> None:
+        self.parent = list(range(n))
 
+    def find(self, x: int) -> int:
+        root = x
+        while self.parent[root] != root:
+            root = self.parent[root]
+        while self.parent[x] != root:
+            self.parent[x], x = root, self.parent[x]
+        return root
 
-# ---------------------------------------------------------------------------
-# Progress callback type alias
-# ---------------------------------------------------------------------------
-ProgressFn = Callable[[ScanProgress], None]
-GroupReadyFn = Callable[[DuplicateGroup], None]
+    def union(self, a: int, b: int) -> None:
+        ra, rb = self.find(a), self.find(b)
+        if ra != rb:
+            self.parent[rb] = ra
 
 
 @dataclass
-class EngineResult:
-    """Final engine output."""
-
-    groups: List[DuplicateGroup] = field(default_factory=list)
-    file_count: int = 0
-    skipped: int = 0
-    elapsed_sec: float = 0.0
-    pair_count: int = 0
-    metadata: Dict[str, MediaMetadata] = field(default_factory=dict)
+class ScanStats:
+    files_total: int = 0
+    files_prepared: int = 0
+    candidate_pairs: int = 0
+    pairs_compared: int = 0
+    groups_found: int = 0
+    errors: int = 0
 
 
-# ---------------------------------------------------------------------------
-class Engine:
-    """Orchestrates the full scan pipeline."""
+class DuplicateEngine:
+    """Drives a single scan over a list of discovered :class:`VideoFile`."""
 
     def __init__(
         self,
-        config: AppConfig,
-        cache: Cache,
-        cancel_event: Optional[threading.Event] = None,
-        progress_cb: Optional[ProgressFn] = None,
-        log_cb: Optional[Callable[[str], None]] = None,
+        tools: MediaTools,
+        options: ScanOptions,
+        cache: Optional[SignatureCache] = None,
+        on_progress: Optional[ProgressCb] = None,
+        on_log: Optional[LogCb] = None,
+        on_error: Optional[ErrorCb] = None,
+        is_cancelled: Optional[Callable[[], bool]] = None,
+        temp_dir: Optional[str] = None,
     ) -> None:
-        self.config = config
+        self.tools = tools
+        self.options = options
         self.cache = cache
-        self.cancel_event = cancel_event or threading.Event()
-        self.progress_cb = progress_cb or (lambda _p: None)
-        self.log_cb = log_cb or (lambda _s: None)
-        self.ctx = MethodContext(
-            cache=cache, cancel_event=self.cancel_event, config=config
+        self._progress = on_progress or (lambda d, t, m: None)
+        self._log = on_log or (lambda m: None)
+        self._on_error = on_error or (lambda p, m: None)
+        self._cancelled = is_cancelled or (lambda: False)
+        self._own_temp = temp_dir is None
+        self.temp_dir = temp_dir or tempfile.mkdtemp(prefix="vidcomp_")
+        self.stats = ScanStats()
+
+    # --- public API --------------------------------------------------------
+    def run(self, files: list[VideoFile]) -> list[DuplicateGroup]:
+        try:
+            return self._run(files)
+        finally:
+            self._cleanup_temp()
+
+    # --- internals ---------------------------------------------------------
+    def _run(self, files: list[VideoFile]) -> list[DuplicateGroup]:
+        self.stats.files_total = len(files)
+        enabled = set(self.options.enabled_methods)
+        log.info(
+            "Engine starting: %d files, methods=%s, logic=%s, workers=%d, temp=%s",
+            len(files),
+            sorted(m.value for m in enabled),
+            self.options.match_logic.value,
+            int(getattr(self.options, "worker_count", 0)),
+            self.temp_dir,
         )
-        self._skipped = 0
-        self._start = 0.0
-
-    # ------------------------------------------------------------------
-    def run(self, root: str | Path) -> EngineResult:
-        """Execute the full pipeline."""
-        self._start = time.time()
-        self._skipped = 0
-
-        methods = self._select_methods()
-        if not methods:
-            self._emit_progress("No comparison methods enabled — nothing to do.")
-            return EngineResult(elapsed_sec=time.time() - self._start)
-
-        # ---- A. Discovery
-        self._emit_progress("Scanning folder…")
-        files = self._discover_files(root)
-        if not files or self.cancel_event.is_set():
-            return EngineResult(
-                file_count=len(files),
-                skipped=self._skipped,
-                elapsed_sec=time.time() - self._start,
-            )
-
-        # ---- (B-pre) Apply min_duration filter (needs metadata, do it lazily)
-        if self.config.min_duration_sec > 0:
-            files = self._filter_by_duration(files)
-            if not files or self.cancel_event.is_set():
-                return EngineResult(
-                    file_count=len(files),
-                    skipped=self._skipped,
-                    elapsed_sec=time.time() - self._start,
-                )
-
-        # ---- B. Signature computation (parallel)
-        signature_methods = [m for m in methods if m.kind == "signature"]
-        signatures = self._compute_signatures(files, signature_methods)
-        if self.cancel_event.is_set():
-            return EngineResult(
-                file_count=len(files),
-                skipped=self._skipped,
-                elapsed_sec=time.time() - self._start,
-            )
-
-        # ---- C. Candidate pair generation
-        self._emit_progress("Building candidate pairs…")
-        pairs = self._generate_candidate_pairs(files, signatures, methods)
-        self._emit_progress(f"Evaluating {len(pairs):,} candidate pair(s)…")
-
-        # ---- D. Pair evaluation
-        pair_results = self._evaluate_pairs(pairs, files, signatures, methods)
-        if self.cancel_event.is_set():
-            return EngineResult(
-                file_count=len(files),
-                skipped=self._skipped,
-                elapsed_sec=time.time() - self._start,
-                pair_count=len(pairs),
-            )
-
-        # ---- E. Combination logic → matched pairs
-        matched = [pr for pr in pair_results if pr.matched]
-
-        # ---- F. Grouping
-        groups = grouping.build_groups(files, matched)
-
-        # Backfill metadata for files in groups so the UI and keep-rules have
-        # resolution / duration / codec available even when M4 wasn't enabled.
-        self._backfill_metadata(groups)
-
-        # ---- G. Keep-rule
-        keep_rules.apply_to_all(groups, self.config.keep_rule, ctx=self.ctx)
-
-        elapsed = time.time() - self._start
-        self._emit_progress(
-            f"Done — {len(groups)} duplicate group(s) found in {elapsed:.1f}s."
-        )
-        return EngineResult(
-            groups=groups,
-            file_count=len(files),
-            skipped=self._skipped,
-            elapsed_sec=elapsed,
-            pair_count=len(pairs),
-            metadata=dict(self.ctx.metadata_cache),
-        )
-
-    # ------------------------------------------------------------------
-    def _select_methods(self) -> List[ComparisonMethod]:
-        ids = sorted(
-            (m for m in self.config.enabled_methods if m in METHOD_REGISTRY),
-            key=lambda x: _METHOD_COST_ORDER.index(x) if x in _METHOD_COST_ORDER else 99,
-        )
-        methods = instantiate_methods(ids)
-
-        # Strip methods whose tool is unavailable, log to user.
-        kept: List[ComparisonMethod] = []
-        for m in methods:
-            if m.id == METHOD_VMAF and not media.has_libvmaf():
-                self._log(f"Skipping {m.display_name}: libvmaf not available in ffmpeg.")
-                continue
-            if m.id == METHOD_AUDIO and not media.has_fpcalc():
-                self._log(f"Skipping {m.display_name}: fpcalc not found on PATH.")
-                continue
-            kept.append(m)
-        return kept
-
-    # ------------------------------------------------------------------
-    def _discover_files(self, root: str | Path) -> List[VideoFile]:
-        files: List[VideoFile] = []
-
-        def on_skip(path: str, reason: str) -> None:
-            self._skipped += 1
-            self._log(f"skip: {path} — {reason}")
-
-        count = 0
-        for vf in scanner.walk_directory(
-            root,
-            self.config.extensions,
-            min_file_size_bytes=self.config.min_file_size_bytes,
-            cancel_check=self.cancel_event.is_set,
-            on_skip=on_skip,
-        ):
-            files.append(vf)
-            count += 1
-            if count % 25 == 0:
-                self._emit_progress(
-                    "Scanning folder…",
-                    current=count,
-                    total=count,
-                    current_file=vf.path,
-                )
-        self._emit_progress(
-            f"Discovered {len(files):,} video file(s).",
-            current=len(files),
-            total=len(files),
-        )
-        return files
-
-    # ------------------------------------------------------------------
-    def _filter_by_duration(self, files: List[VideoFile]) -> List[VideoFile]:
-        """Skip files shorter than ``min_duration_sec`` (requires ffprobe)."""
-        kept: List[VideoFile] = []
-        min_dur = float(self.config.min_duration_sec)
-        for i, f in enumerate(files, 1):
-            if self.cancel_event.is_set():
-                return kept
-            try:
-                md = self._fetch_metadata(f)
-            except Exception:  # noqa: BLE001
-                md = None
-            if md is None or md.duration_sec is None:
-                # Keep — we can't tell.
-                kept.append(f)
-                continue
-            if md.duration_sec >= min_dur:
-                kept.append(f)
-            else:
-                self._skipped += 1
-                self._log(f"skip (too short {md.duration_sec:.1f}s): {f.path}")
-        return kept
-
-    # ------------------------------------------------------------------
-    def _fetch_metadata(self, file: VideoFile) -> Optional[MediaMetadata]:
-        from .methods.m4_metadata import get_or_fetch_metadata  # local: avoid cycle
-        return get_or_fetch_metadata(file, self.ctx)
-
-    # ------------------------------------------------------------------
-    def _backfill_metadata(self, groups: List[DuplicateGroup]) -> None:
-        """Fetch metadata for any in-group file that hasn't been probed yet."""
-        for g in groups:
-            for f in g.files:
-                if self.cancel_event.is_set():
-                    return
-                if f.path in self.ctx.metadata_cache:
-                    continue
-                try:
-                    self._fetch_metadata(f)
-                except Exception:  # noqa: BLE001
-                    continue
-
-    # ------------------------------------------------------------------
-    def _compute_signatures(
-        self,
-        files: List[VideoFile],
-        methods: List[ComparisonMethod],
-    ) -> Dict[str, Dict[str, Any]]:
-        """Return ``{method_id: {file_path: signature}}``."""
-        out: Dict[str, Dict[str, Any]] = {m.id: {} for m in methods}
-        total_units = len(files) * len(methods)
-        if total_units == 0:
-            return out
-
-        workers = max(1, int(self.config.worker_count))
-        done = 0
-        last_emit = time.time()
-
-        def task(m: ComparisonMethod, f: VideoFile) -> Tuple[str, str, Any]:
-            try:
-                sig = m.compute_signature(f, self.ctx)
-            except Exception as exc:  # noqa: BLE001
-                self._log(f"{m.display_name} failed on {f.path}: {exc}")
-                sig = None
-            return m.id, f.path, sig
-
-        with ThreadPoolExecutor(max_workers=workers) as pool:
-            futures: List[Future] = []
-            for m in methods:
-                for f in files:
-                    if self.cancel_event.is_set():
-                        break
-                    futures.append(pool.submit(task, m, f))
-                if self.cancel_event.is_set():
-                    break
-
-            for fut in _as_completed_cancellable(futures, self.cancel_event):
-                try:
-                    method_id, path, sig = fut.result()
-                except Exception as exc:  # noqa: BLE001
-                    self._log(f"signature task failed: {exc}")
-                    continue
-                if sig is not None:
-                    out[method_id][path] = sig
-                done += 1
-                now = time.time()
-                if now - last_emit > 0.15 or done == total_units:
-                    self._emit_progress(
-                        "Computing signatures…",
-                        current=done,
-                        total=total_units,
-                        current_file=path,
-                    )
-                    last_emit = now
-        return out
-
-    # ------------------------------------------------------------------
-    def _generate_candidate_pairs(
-        self,
-        files: List[VideoFile],
-        signatures: Dict[str, Dict[str, Any]],
-        methods: List[ComparisonMethod],
-    ) -> List[Tuple[VideoFile, VideoFile]]:
-        """Bucket files into candidate pairs.
-
-        Strategy: bucket by the cheapest enabled exact-equality signature
-        method.  Falls back to all-pairs if no such method is enabled.  Per
-        ``match_logic="all"``, we additionally intersect with each enabled
-        exact-equality bucket so we don't waste time on pairs that obviously
-        can't match.
-        """
-        cap = max(1, int(self.config.max_pairs_per_bucket))
-        bucket_method = self._pick_bucket_method(methods, signatures)
-        all_pairs: Set[Tuple[str, str]] = set()
-        files_by_path = {f.path: f for f in files}
-
-        if bucket_method is None:
-            # No useful bucketing — N choose 2.
-            pairs_iter = combinations(files, 2)
-            count_for_warning = len(files) * (len(files) - 1) // 2
-            if count_for_warning > cap * 10:
-                self._log(
-                    f"WARNING: no cheap bucketing method enabled; evaluating "
-                    f"{count_for_warning:,} pairs may be slow."
-                )
-            for a, b in pairs_iter:
-                if self.cancel_event.is_set():
-                    return []
-                pair = self._canon_pair(a, b)
-                all_pairs.add(pair)
-                if len(all_pairs) >= cap * 100:
-                    self._log(
-                        f"WARNING: pair cap reached ({cap*100:,}); truncating."
-                    )
-                    break
-        else:
-            sig_map = signatures.get(bucket_method.id, {})
-            buckets: Dict[Any, List[str]] = defaultdict(list)
-            for p, sig in sig_map.items():
-                buckets[sig].append(p)
-            for sig, paths in buckets.items():
-                if self.cancel_event.is_set():
-                    return []
-                if len(paths) < 2:
-                    continue
-                bucket_pairs = list(combinations(paths, 2))
-                if len(bucket_pairs) > cap:
-                    self._log(
-                        f"WARNING: bucket of size {len(paths)} produced "
-                        f"{len(bucket_pairs):,} pairs — capping at {cap:,}."
-                    )
-                    bucket_pairs = bucket_pairs[:cap]
-                for pa, pb in bucket_pairs:
-                    all_pairs.add(self._canon_pair_paths(pa, pb))
-
-        # Materialise as VideoFile tuples in canonical order.
-        result: List[Tuple[VideoFile, VideoFile]] = []
-        for pa, pb in all_pairs:
-            fa = files_by_path.get(pa)
-            fb = files_by_path.get(pb)
-            if fa is not None and fb is not None:
-                result.append((fa, fb))
-        return result
-
-    @staticmethod
-    def _canon_pair(a: VideoFile, b: VideoFile) -> Tuple[str, str]:
-        return (a.path, b.path) if a.path < b.path else (b.path, a.path)
-
-    @staticmethod
-    def _canon_pair_paths(a: str, b: str) -> Tuple[str, str]:
-        return (a, b) if a < b else (b, a)
-
-    def _pick_bucket_method(
-        self,
-        methods: List[ComparisonMethod],
-        signatures: Dict[str, Dict[str, Any]],
-    ) -> Optional[ComparisonMethod]:
-        """Return the cheapest enabled equality-based method we can bucket by.
-
-        Approximate methods (pHash, audio) are unsuitable bucketers because
-        their equality alone doesn't predict matches.
-        """
-        cheap_order = (
-            METHOD_SIZE,
-            METHOD_PARTIAL_HASH,
-            METHOD_METADATA,
-            METHOD_SHA256,
-        )
-        by_id = {m.id: m for m in methods}
-        for mid in cheap_order:
-            if mid in by_id and signatures.get(mid):
-                return by_id[mid]
-        return None
-
-    # ------------------------------------------------------------------
-    def _evaluate_pairs(
-        self,
-        pairs: List[Tuple[VideoFile, VideoFile]],
-        files: List[VideoFile],
-        signatures: Dict[str, Dict[str, Any]],
-        methods: List[ComparisonMethod],
-    ) -> List[PairResult]:
-        if not pairs or not methods:
+        if not enabled:
+            self._log("No comparison methods enabled; nothing to do.")
             return []
 
-        # Order methods cheapest → most expensive so short-circuit logic works.
-        ordered = sorted(
-            methods,
-            key=lambda m: _METHOD_COST_ORDER.index(m.id)
-            if m.id in _METHOD_COST_ORDER else 99,
+        methods = {mid: build_method(mid) for mid in enabled}
+        ctx = MethodContext(
+            tools=self.tools,
+            options=self.options,
+            temp_dir=self.temp_dir,
+            is_cancelled=self._cancelled,
         )
-        match_logic = self.config.match_logic
-        cheap_methods = [m for m in ordered if m.kind == "signature"]
-        expensive_methods = [m for m in ordered if m.kind == "pairwise"]
-
-        total = len(pairs)
-        done = 0
-        last_emit = time.time()
-        results: List[PairResult] = []
-        results_lock = threading.Lock()
-
-        def cheap_phase(pair: Tuple[VideoFile, VideoFile]) -> Optional[PairResult]:
-            """Evaluate cheap methods synchronously; decide whether expensive ones are needed."""
-            a, b = pair
-            pr = PairResult(path_a=a.path, path_b=b.path)
-            for m in cheap_methods:
-                if self.cancel_event.is_set():
-                    return None
-                sig_a = signatures.get(m.id, {}).get(a.path)
-                sig_b = signatures.get(m.id, {}).get(b.path)
-                ev = m.evaluate_pair(a, b, sig_a, sig_b, self.ctx)
-                pr.evidences.append(ev)
-                # An abstained evidence is neutral — neither short-circuits nor decides.
-                if ev.abstain:
-                    continue
-                if match_logic == MATCH_ALL and not ev.matched:
-                    # Short-circuit: in ALL mode, one disagreement kills the pair.
-                    pr.matched = False
-                    return pr
-            # Decide whether to run expensive methods.
-            if match_logic == MATCH_ALL:
-                # If we still need every method to agree, we *must* run expensive ones.
-                pass
-            elif match_logic == MATCH_ANY and any(
-                e.matched and not e.abstain for e in pr.evidences
-            ):
-                # ANY: a cheap method already agreed — skip the expensive phase.
-                pr.matched = True
-                return pr
-            return pr  # caller will run expensive phase
-
-        def expensive_phase(pr: PairResult, pair: Tuple[VideoFile, VideoFile]) -> PairResult:
-            a, b = pair
-            for m in expensive_methods:
-                if self.cancel_event.is_set():
-                    return pr
-                ev = m.evaluate_pair(a, b, None, None, self.ctx)
-                pr.evidences.append(ev)
-                if ev.abstain:
-                    continue
-                if match_logic == MATCH_ALL and not ev.matched:
-                    pr.matched = False
-                    return pr
-            return pr
-
-        def finalize(pr: PairResult) -> PairResult:
-            # Consider only non-abstained evidences for the verdict.
-            voting = [e for e in pr.evidences if not e.abstain]
-            if not voting:
-                # No method could decide → not a match.
-                pr.matched = False
-                return pr
-            if match_logic == MATCH_ALL:
-                pr.matched = all(e.matched for e in voting)
+        # Drop methods that cannot run in this environment (missing tools).
+        usable: dict[MethodId, object] = {}
+        for mid, m in methods.items():
+            if m.available(ctx):  # type: ignore[attr-defined]
+                usable[mid] = m
+                log.debug("method enabled: %s", mid.value)
             else:
-                pr.matched = any(e.matched for e in voting)
-            return pr
+                self._log(f"Method {mid.value} unavailable (missing tool); skipped.")
+                log.warning("method disabled (env): %s", mid.value)
+        if not usable:
+            self._log("No usable comparison methods in this environment.")
+            return []
 
-        # We run pairs in parallel.  Each pair runs its cheap+expensive phase
-        # in one task; the engine's ThreadPoolExecutor caps concurrency.
-        def task(pair: Tuple[VideoFile, VideoFile]) -> Optional[PairResult]:
-            pr = cheap_phase(pair)
-            if pr is None:
-                return None
-            # If ANY-logic and cheap already matched, skip expensive.
-            if not (match_logic == MATCH_ANY and pr.matched):
-                pr = expensive_phase(pr, pair)
-            return finalize(pr)
+        # Apply min-duration filter early if we can probe.
+        files = self._apply_duration_filter(files, usable, ctx)
+        if self._cancelled():
+            return []
 
-        workers = max(1, int(self.config.worker_count))
-        with ThreadPoolExecutor(max_workers=workers) as pool:
-            futures = [pool.submit(task, p) for p in pairs]
-            for fut in _as_completed_cancellable(futures, self.cancel_event):
-                try:
-                    pr = fut.result()
-                except Exception as exc:  # noqa: BLE001
-                    self._log(f"pair evaluation failed: {exc}")
-                    pr = None
-                if pr is not None:
-                    with results_lock:
-                        results.append(pr)
-                done += 1
-                now = time.time()
-                if now - last_emit > 0.15 or done == total:
-                    self._emit_progress(
-                        "Comparing pairs…",
-                        current=done,
-                        total=total,
-                    )
-                    last_emit = now
-        return results
+        # Phase 1: prepare per-file signatures.
+        log.info("Phase 1/3: preparing per-file signatures (%d files)", len(files))
+        self._prepare_signatures(files, usable, ctx)
+        if self._cancelled():
+            return []
 
-    # ------------------------------------------------------------------
-    def _emit_progress(
-        self,
-        stage: str,
-        current: int = 0,
-        total: int = 0,
-        current_file: str = "",
-        note: str = "",
-    ) -> None:
-        elapsed = time.time() - self._start if self._start else 0.0
-        eta = 0.0
-        if current > 0 and total > 0 and current < total:
-            per = elapsed / current
-            eta = per * (total - current)
-        p = ScanProgress(
-            stage=stage,
-            current=current,
-            total=total,
-            current_file=current_file,
-            elapsed_sec=elapsed,
-            eta_sec=eta,
-            skipped=self._skipped,
-            note=note,
+        # Phase 2: generate candidate pairs cheaply.
+        log.info("Phase 2/3: generating candidate pairs")
+        pairs = self._candidate_pairs(files, usable)
+        self.stats.candidate_pairs = len(pairs)
+        self._log(f"Evaluating {len(pairs)} candidate pair(s).")
+        log.info("Phase 3/3: evaluating %d candidate pair(s)", len(pairs))
+
+        # Phase 3: evaluate pairs (escalating to expensive metrics last).
+        uf = _UnionFind(len(files))
+        evidence_by_path: dict[str, list[MatchEvidence]] = {}
+        total = max(1, len(pairs))
+        for done, (i, j) in enumerate(pairs, start=1):
+            if self._cancelled():
+                return []
+            self._progress(done, total, f"Comparing {files[i].name} <-> {files[j].name}")
+            self.stats.pairs_compared += 1
+            ev = self._evaluate_pair(files[i], files[j], usable, ctx)
+            if ev:
+                log.debug(
+                    "MATCH: %s <-> %s via %s",
+                    files[i].name, files[j].name,
+                    ",".join(e.method.value for e in ev),
+                )
+                uf.union(i, j)
+                evidence_by_path.setdefault(files[i].path, []).extend(ev)
+                evidence_by_path.setdefault(files[j].path, []).extend(ev)
+
+        # Phase 4: build groups from the union-find clusters.
+        return self._build_groups(files, uf, evidence_by_path)
+
+    def _apply_duration_filter(self, files, usable, ctx) -> list[VideoFile]:
+        min_dur = float(getattr(self.options, "min_duration_seconds", 0.0) or 0.0)
+        if min_dur <= 0 or not self.tools.has_ffprobe:
+            return files
+        kept: list[VideoFile] = []
+        for vf in files:
+            if self.cache:
+                self.cache.load_into(vf)
+            if vf.info is None:
+                vf.info = self.tools.probe(vf.path)
+                if self.cache:
+                    self.cache.save(vf)
+            if vf.info and vf.info.duration is not None and vf.info.duration < min_dur:
+                continue
+            kept.append(vf)
+        if len(kept) != len(files):
+            self._log(f"Filtered out {len(files) - len(kept)} clip(s) below min duration.")
+        return kept
+
+    def _prepare_signatures(self, files, usable, ctx) -> None:  # noqa: C901
+        log.debug(
+            "_prepare_signatures: enabled=%s",
+            sorted(m.value for m in usable.keys()),
         )
-        try:
-            self.progress_cb(p)
-        except Exception:  # noqa: BLE001
-            pass
+        enabled = set(usable.keys())
+        need_info = bool(enabled & {MethodId.METADATA, MethodId.PHASH, MethodId.SSIM, MethodId.PSNR, MethodId.VMAF})
 
-    def _log(self, line: str) -> None:
-        LOG.info(line)
-        try:
-            self.log_cb(line)
-        except Exception:  # noqa: BLE001
-            pass
+        # Size-bucket optimization: only fully hash files that share a size.
+        size_groups: dict[int, list[int]] = {}
+        for idx, vf in enumerate(files):
+            size_groups.setdefault(vf.size, []).append(idx)
+        hash_eligible = {idx for ids in size_groups.values() if len(ids) > 1 for idx in ids}
 
+        total = len(files)
+        self._progress(0, total, "Preparing signatures...")
 
-# ---------------------------------------------------------------------------
-def _as_completed_cancellable(
-    futures: List[Future],
-    cancel_event: threading.Event,
-):
-    """Like :func:`concurrent.futures.as_completed`, but honours cancel_event.
+        def prepare_one(idx_vf: tuple[int, VideoFile]) -> tuple[int, Optional[str]]:
+            idx, vf = idx_vf
+            if self._cancelled():
+                return idx, None
+            try:
+                if self.cache:
+                    self.cache.load_into(vf)
+                # Metadata / info.
+                if need_info and vf.info is None:
+                    vf.info = self.tools.probe(vf.path)
+                # Hash methods only matter when sizes collide.
+                if idx in hash_eligible:
+                    if MethodId.PARTIAL_HASH in usable:
+                        usable[MethodId.PARTIAL_HASH].prepare(vf, ctx)  # type: ignore[attr-defined]
+                    if MethodId.SHA256 in usable:
+                        usable[MethodId.SHA256].prepare(vf, ctx)  # type: ignore[attr-defined]
+                # Perceptual hash + audio fingerprint apply across sizes.
+                if MethodId.PHASH in usable:
+                    usable[MethodId.PHASH].prepare(vf, ctx)  # type: ignore[attr-defined]
+                if MethodId.AUDIO in usable:
+                    usable[MethodId.AUDIO].prepare(vf, ctx)  # type: ignore[attr-defined]
+                if self.cache:
+                    self.cache.save(vf)
+                return idx, None
+            except Exception as exc:  # never let one bad file kill the scan
+                log.exception("prepare failed for %s", vf.path)
+                return idx, str(exc)
 
-    When the event is set, in-flight futures are cancelled (best-effort) and
-    we stop iterating.
-    """
-    pending = set(futures)
-    while pending:
-        if cancel_event.is_set():
-            for fut in pending:
-                fut.cancel()
-            return
-        done, pending = wait(pending, timeout=0.2, return_when=FIRST_COMPLETED)
-        for fut in done:
-            yield fut
+        workers = max(1, int(getattr(self.options, "worker_count", 4)))
+        done = 0
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = {pool.submit(prepare_one, (i, vf)): i for i, vf in enumerate(files)}
+            for fut in as_completed(futures):
+                if self._cancelled():
+                    pool.shutdown(wait=False, cancel_futures=True)
+                    return
+                idx, err = fut.result()
+                done += 1
+                self.stats.files_prepared = done
+                vf = files[idx]
+                if err:
+                    self.stats.errors += 1
+                    vf.error = err
+                    self._on_error(vf.path, err)
+                self._progress(done, total, f"Prepared {vf.name}")
+
+    def _candidate_pairs(self, files, usable) -> list[tuple[int, int]]:
+        """Cheap candidate generation: equal-size and close-duration pairs."""
+        pairs: set[tuple[int, int]] = set()
+
+        # Equal-size buckets (exact duplicates / remuxes).
+        size_groups: dict[int, list[int]] = {}
+        for idx, vf in enumerate(files):
+            size_groups.setdefault(vf.size, []).append(idx)
+        size_bucketed = 0
+        for ids in size_groups.values():
+            if len(ids) > 1:
+                for a, b in itertools.combinations(sorted(ids), 2):
+                    pairs.add((a, b))
+                    size_bucketed += 1
+        log.debug("candidates: %d pair(s) from equal-size buckets", size_bucketed)
+
+        # Close-duration pairs (re-encodes / resizes differ in size).
+        before = len(pairs)
+        has_durations = any(vf.info and vf.info.duration for vf in files)
+        if has_durations:
+            indexed = [
+                (vf.info.duration, idx)
+                for idx, vf in enumerate(files)
+                if vf.info and vf.info.duration
+            ]
+            indexed.sort()
+            for a_pos in range(len(indexed)):
+                da, ia = indexed[a_pos]
+                tol = max(1.0, 0.02 * da)
+                for b_pos in range(a_pos + 1, len(indexed)):
+                    db, ib = indexed[b_pos]
+                    if db - da > tol:
+                        break
+                    pair = (ia, ib) if ia < ib else (ib, ia)
+                    pairs.add(pair)
+        log.debug("candidates: +%d pair(s) from duration buckets", len(pairs) - before)
+
+        # Fallback: only expensive/perceptual methods enabled and nothing
+        # bucketed - compare all pairs if the set is small enough.
+        if not pairs and len(files) > 1 and (set(usable) & (_EXPENSIVE | {MethodId.PHASH})):
+            if len(files) <= _ALL_PAIRS_CAP:
+                for a, b in itertools.combinations(range(len(files)), 2):
+                    pairs.add((a, b))
+            else:
+                self._log(
+                    f"Too many files ({len(files)}) for all-pairs fallback; "
+                    "enable size/metadata methods to narrow candidates."
+                )
+        return sorted(pairs)
+
+    def _evaluate_pair(self, a: VideoFile, b: VideoFile, usable, ctx) -> list[MatchEvidence]:
+        """Apply enabled methods cheap-first; honor ANY/ALL match logic.
+
+        File size (M1) is treated as a pre-filter for candidate bucketing, not
+        as a standalone match vote: two unrelated files that merely share a byte
+        size must not be flagged as duplicates.  It only casts a vote when it is
+        the single enabled method (a deliberate "group by size" request).
+        """
+        logic = self.options.match_logic
+        voting = list(usable.keys())
+        if len(voting) > 1 and MethodId.SIZE in voting:
+            voting = [m for m in voting if m != MethodId.SIZE]
+        voting_set = set(voting)
+        cheap_ids = [m for m in usable if m in _CHEAP and m in voting_set]
+        expensive_ids = [m for m in usable if m in _EXPENSIVE and m in voting_set]
+
+        evidence: list[MatchEvidence] = []
+        cheap_hits = 0
+        cheap_total = len(cheap_ids)
+
+        for mid in cheap_ids:
+            ev = usable[mid].compare(a, b, ctx)  # type: ignore[attr-defined]
+            if ev:
+                evidence.append(ev)
+                cheap_hits += 1
+            elif logic == MatchLogic.ALL:
+                # ALL logic: a single cheap miss already disqualifies the pair.
+                return []
+
+        if logic == MatchLogic.ANY and cheap_hits > 0:
+            # Already a match; skip expensive metrics for performance.
+            return evidence
+
+        # Escalate to expensive metrics only for survivors.
+        exp_hits = 0
+        for mid in expensive_ids:
+            if self._cancelled():
+                return []
+            ev = usable[mid].compare(a, b, ctx)  # type: ignore[attr-defined]
+            if ev:
+                evidence.append(ev)
+                exp_hits += 1
+                if logic == MatchLogic.ANY:
+                    return evidence
+            elif logic == MatchLogic.ALL:
+                return []
+
+        if logic == MatchLogic.ALL:
+            # Matched only if every enabled method produced evidence.
+            return evidence if len(evidence) == (cheap_total + len(expensive_ids)) else []
+        # ANY: matched if anything produced evidence.
+        return evidence if evidence else []
+
+    def _build_groups(self, files, uf: _UnionFind, evidence_by_path) -> list[DuplicateGroup]:
+        clusters: dict[int, list[int]] = {}
+        for idx in range(len(files)):
+            clusters.setdefault(uf.find(idx), []).append(idx)
+
+        groups: list[DuplicateGroup] = []
+        for ids in clusters.values():
+            if len(ids) < 2:
+                continue
+            g = DuplicateGroup(files=[files[i] for i in ids])
+            for i in ids:
+                p = files[i].path
+                if p in evidence_by_path:
+                    g.evidence[p] = list(evidence_by_path[p])
+            groups.append(g)
+
+        # Largest groups first for a tidy UI.
+        groups.sort(key=lambda g: (-len(g.files), -g.total_size))
+        self.stats.groups_found = len(groups)
+        self._log(f"Found {len(groups)} duplicate group(s).")
+        return groups
+
+    def _cleanup_temp(self) -> None:
+        if self._own_temp:
+            shutil.rmtree(self.temp_dir, ignore_errors=True)
+        else:
+            # Remove only our transient frame scratch space.
+            shutil.rmtree(os.path.join(self.temp_dir, "frames"), ignore_errors=True)

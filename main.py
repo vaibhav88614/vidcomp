@@ -1,133 +1,231 @@
-"""VidComp entry point.
+"""VidComp application entry point.
 
-Usage::
+Run with::
 
-    python main.py              # launch the GUI
-    python main.py --self-check # print external-tool status & exit
+    python main.py            # normal run (console + file logging)
+    python main.py --debug    # verbose DEBUG-level logging
+
+You can also force debug logging via the ``VIDCOMP_DEBUG=1`` environment
+variable.  In a PyInstaller frozen build the console window is kept open
+(see ``build.ps1`` / ``VidComp.spec``) so any startup / runtime errors are
+visible immediately and also written to ``%APPDATA%\\VidComp\\logs\\vidcomp.log``.
 """
 
 from __future__ import annotations
 
-import argparse
 import logging
-import logging.handlers
 import os
+import platform
 import sys
-from pathlib import Path
+import traceback
+from logging.handlers import RotatingFileHandler
 
 
-def _setup_logging(log_path: Path) -> "QtLogHandler | None":
-    """Install logging to a rotating file + the in-app Qt handler.
+# --- standard-stream safety (frozen --noconsole builds) --------------------
+# When PyInstaller is built with --noconsole, sys.stdout/sys.stderr may be
+# ``None``.  We default to the console build, but be defensive anyway so a
+# stray ``print`` or logging call never crashes the process.
+def _ensure_streams() -> None:
+    if sys.stdout is None:
+        sys.stdout = open(os.devnull, "w", encoding="utf-8")
+    if sys.stderr is None:
+        sys.stderr = open(os.devnull, "w", encoding="utf-8")
+    # Best-effort: make stdout line-buffered so debug prints show up promptly
+    # when running from a console (Windows cmd / PowerShell).
+    try:
+        sys.stdout.reconfigure(line_buffering=True)  # type: ignore[attr-defined]
+        sys.stderr.reconfigure(line_buffering=True)  # type: ignore[attr-defined]
+    except Exception:
+        pass
 
-    The Qt handler is returned so :class:`MainWindow` can wire it to the log dock.
-    Returns ``None`` when called from ``--self-check`` mode (no Qt available).
-    """
+
+def _is_frozen() -> bool:
+    return getattr(sys, "frozen", False)
+
+
+def _debug_enabled(argv: list[str]) -> bool:
+    if os.environ.get("VIDCOMP_DEBUG", "").lower() in {"1", "true", "yes", "on"}:
+        return True
+    return any(a in {"--debug", "-d"} for a in argv)
+
+
+def _setup_logging(debug: bool) -> logging.Logger:
+    """Log to both a rotating file and the console with verbose context."""
+    from vidcomp.config import default_config_dir
+
+    log_dir = default_config_dir() / "logs"
+    file_handler: logging.Handler
+    try:
+        log_dir.mkdir(parents=True, exist_ok=True)
+        file_handler = RotatingFileHandler(
+            log_dir / "vidcomp.log",
+            maxBytes=2_000_000,
+            backupCount=5,
+            encoding="utf-8",
+        )
+    except Exception as exc:
+        # Logging to a file is best-effort; never let it stop the app.
+        sys.stderr.write(f"[VidComp] WARNING: could not open log file: {exc}\n")
+        file_handler = logging.NullHandler()
+
+    fmt = logging.Formatter(
+        "%(asctime)s %(levelname)-5s %(name)s [%(threadName)s] %(message)s",
+        datefmt="%H:%M:%S",
+    )
+    file_handler.setFormatter(fmt)
+    console = logging.StreamHandler(stream=sys.stdout)
+    console.setFormatter(fmt)
+
+    level = logging.DEBUG if debug else logging.INFO
     root = logging.getLogger()
-    root.setLevel(logging.INFO)
-    # Remove default handlers attached by libraries.
+    root.setLevel(level)
+    # Wipe any pre-existing handlers (e.g. a previous main() call in tests).
     for h in list(root.handlers):
         root.removeHandler(h)
+    root.addHandler(file_handler)
+    root.addHandler(console)
 
-    fmt = logging.Formatter("%(asctime)s  %(levelname)-7s  %(name)s  %(message)s",
-                            datefmt="%H:%M:%S")
+    # Qt is chatty; keep its warnings but not at DEBUG firehose level.
+    logging.getLogger("PySide6").setLevel(logging.INFO)
 
-    # File handler — rotating, capped at ~2 MB × 3 files.
-    try:
-        log_path.parent.mkdir(parents=True, exist_ok=True)
-        file_h = logging.handlers.RotatingFileHandler(
-            str(log_path), maxBytes=2 * 1024 * 1024, backupCount=3, encoding="utf-8"
+    return logging.getLogger("vidcomp.main")
+
+
+def _install_excepthook(log: logging.Logger) -> None:
+    """Route all otherwise-unhandled exceptions through the logger."""
+
+    def hook(exc_type, exc_value, exc_tb):
+        if issubclass(exc_type, KeyboardInterrupt):
+            sys.__excepthook__(exc_type, exc_value, exc_tb)
+            return
+        log.critical(
+            "Unhandled exception:\n%s",
+            "".join(traceback.format_exception(exc_type, exc_value, exc_tb)),
         )
-        file_h.setFormatter(fmt)
-        file_h.setLevel(logging.INFO)
-        root.addHandler(file_h)
-    except OSError as exc:
-        print(f"warning: could not open log file {log_path}: {exc}", file=sys.stderr)
 
-    # Console handler (always).
-    con_h = logging.StreamHandler(sys.stderr)
-    con_h.setFormatter(fmt)
-    con_h.setLevel(logging.WARNING)
-    root.addHandler(con_h)
+    sys.excepthook = hook
 
-    # Qt handler (only if PySide6 is around — i.e. GUI mode).
+    # Also catch exceptions raised in background threads (Python 3.8+).
     try:
-        from vidcomp.gui.widgets.log_panel import QtLogHandler
-    except ImportError:
-        return None
-    qt_h = QtLogHandler()
-    qt_h.setFormatter(fmt)
-    qt_h.setLevel(logging.INFO)
-    root.addHandler(qt_h)
-    return qt_h
+        import threading
+
+        def thread_hook(args):  # threading.ExceptHookArgs
+            if issubclass(args.exc_type, SystemExit):
+                return
+            log.critical(
+                "Unhandled exception in thread %s:\n%s",
+                args.thread.name if args.thread else "?",
+                "".join(
+                    traceback.format_exception(
+                        args.exc_type, args.exc_value, args.exc_traceback
+                    )
+                ),
+            )
+
+        threading.excepthook = thread_hook  # type: ignore[assignment]
+    except Exception:  # pragma: no cover - very old runtimes only
+        pass
 
 
-def _print_tool_status() -> int:
-    """``--self-check`` mode — exit code 0 if required tools are present."""
-    from vidcomp.core import media
+def _log_startup_banner(log: logging.Logger) -> None:
+    from vidcomp import __app_name__, __version__
 
-    status = media.detect_tools(force=True)
-    print(f"VidComp tool detection report:\n")
-    print(f"  ffmpeg:  {'OK ' if status.ffmpeg.available else 'MISSING'}  "
-          f"{status.ffmpeg.path or ''}")
-    print(f"  ffprobe: {'OK ' if status.ffprobe.available else 'MISSING'}  "
-          f"{status.ffprobe.path or ''}")
-    print(f"  fpcalc:  {'OK ' if status.fpcalc.available else 'MISSING'}  "
-          f"{status.fpcalc.path or ''}")
-    print(f"  libvmaf: {'present' if status.libvmaf else 'NOT in ffmpeg build'}")
-    if status.required_ok:
-        print("\nRequired tools are present — VidComp can run.")
-        if status.missing_optional:
-            print(f"Optional features disabled: {', '.join(status.missing_optional)}")
-        return 0
-    print("\nERROR: ffmpeg/ffprobe are required and were not found on PATH.",
-          file=sys.stderr)
-    return 1
+    log.info("=" * 72)
+    log.info("%s %s starting", __app_name__, __version__)
+    log.info("python      : %s", sys.version.replace("\n", " "))
+    log.info("executable  : %s", sys.executable)
+    log.info("platform    : %s", platform.platform())
+    log.info("frozen      : %s", _is_frozen())
+    log.info("cwd         : %s", os.getcwd())
+    log.info("argv        : %s", sys.argv)
+    try:
+        import PySide6  # type: ignore
+
+        log.info("PySide6     : %s", getattr(PySide6, "__version__", "?"))
+    except Exception:  # pragma: no cover - PySide6 always installed in practice
+        log.warning("PySide6 import failed")
+    log.info("=" * 72)
 
 
-def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(prog="vidcomp", description=__doc__)
-    parser.add_argument(
-        "--self-check",
-        action="store_true",
-        help="Check external tools (ffmpeg, ffprobe, fpcalc, libvmaf) and exit.",
-    )
-    parser.add_argument(
-        "--folder",
-        metavar="PATH",
-        help="Pre-fill the folder picker with this path on launch.",
-    )
-    args = parser.parse_args(argv)
+def main() -> int:
+    _ensure_streams()
+    debug = _debug_enabled(sys.argv)
+    log = _setup_logging(debug)
+    _install_excepthook(log)
+    _log_startup_banner(log)
+    if debug:
+        log.debug("DEBUG logging enabled (VIDCOMP_DEBUG or --debug)")
 
-    # Load config early so we know where to log.
-    from vidcomp.config import AppConfig
+    try:
+        # Qt imports are kept inside main so that --help style tooling and the
+        # unit tests (which only touch the engine) do not require a display.
+        log.debug("Importing PySide6 + vidcomp modules...")
+        from PySide6.QtWidgets import QApplication
 
-    config = AppConfig.load()
-    log_path = Path(config.log_path)
-    qt_handler = _setup_logging(log_path)
+        from vidcomp import __app_name__
+        from vidcomp.config import AppConfig
+        from vidcomp.core.media import MediaTools
+        from vidcomp.gui.main_window import MainWindow
+        from vidcomp.gui.style import apply_theme
+        from vidcomp.gui.widgets.tool_check_dialog import ToolCheckDialog
 
-    if args.self_check:
-        return _print_tool_status()
+        os.environ.setdefault("QT_ENABLE_HIGHDPI_SCALING", "1")
 
-    # ---- GUI mode
-    # Ensure high-DPI behaviour is sane on Windows.
-    os.environ.setdefault("QT_ENABLE_HIGHDPI_SCALING", "1")
+        log.debug("Constructing QApplication")
+        app = QApplication(sys.argv)
+        app.setApplicationName(__app_name__)
+        app.setOrganizationName("VidComp")
 
-    from PySide6.QtCore import Qt
-    from PySide6.QtWidgets import QApplication
+        log.debug("Loading persistent config")
+        config = AppConfig.load()
+        log.debug(
+            "Config loaded: mode=%s methods=%s keep_rule=%s delete_mode=%s",
+            config.scan_options.mode.value,
+            sorted(m.value for m in config.scan_options.enabled_methods),
+            config.keep_rule.value,
+            config.delete_mode.value,
+        )
 
-    app = QApplication(sys.argv)
-    app.setApplicationName("VidComp")
-    app.setOrganizationName("VidComp")
-    app.setQuitOnLastWindowClosed(True)
+        apply_theme(app, config.dark_mode)
 
-    from vidcomp.gui.main_window import MainWindow
+        log.debug("Detecting external media tools")
+        tools = MediaTools()
+        log.info(
+            "Tools - ffmpeg:%s ffprobe:%s fpcalc:%s vmaf:%s",
+            tools.has_ffmpeg, tools.has_ffprobe, tools.has_fpcalc, tools.has_vmaf(),
+        )
+        for st in tools.status():
+            log.info(
+                "  %-8s available=%s path=%s%s",
+                st.name,
+                st.available,
+                st.path or "-",
+                "  libvmaf=yes" if (st.name == "ffmpeg" and st.has_vmaf) else "",
+            )
 
-    if args.folder:
-        config.last_scan_folder = args.folder
-    win = MainWindow(config, qt_handler)  # type: ignore[arg-type]
-    win.show()
-    return app.exec()
+        log.debug("Building MainWindow")
+        window = MainWindow(config, tools)
+        window.show()
+
+        if not (tools.has_ffmpeg and tools.has_ffprobe):
+            log.warning("ffmpeg/ffprobe missing - showing tool-check dialog")
+            ToolCheckDialog(tools.status(), window).exec()
+
+        log.info("Entering Qt event loop")
+        rc = app.exec()
+        log.info("Qt event loop exited with code %s", rc)
+        return rc
+    except Exception:
+        log.exception("Fatal error during startup")
+        # In a console build the traceback is also visible; pause so the user
+        # can read it before the window closes.
+        if _is_frozen() and sys.stdout is not None and sys.stdout.isatty():
+            try:
+                input("\n[VidComp] Press Enter to close...")
+            except Exception:
+                pass
+        return 1
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    raise SystemExit(main())

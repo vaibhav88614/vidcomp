@@ -1,10 +1,7 @@
-"""Plain-language Help dialog explaining scan modes and each method."""
+"""Help / About dialog explaining scan modes and methods in plain language."""
 
 from __future__ import annotations
 
-from typing import Optional
-
-from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QDialog,
     QDialogButtonBox,
@@ -13,89 +10,62 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from ... import __app_name__, __version__
 
-_HELP_HTML = """
-<h2>VidComp — how it works</h2>
-<p><b>VidComp</b> recursively scans a folder for video files and finds duplicates and
-near-duplicates by comparing their <i>content</i>, not their filenames.</p>
+_HELP_HTML = f"""
+<h2>{__app_name__} {__version__}</h2>
+<p>VidComp finds duplicate and visually similar videos by their <i>content</i>,
+not their filenames, then helps you delete the extras safely.</p>
 
 <h3>Scan modes</h3>
 <ul>
-  <li><b>Easy</b> — fastest. Catches files that are byte-identical or share the same
-    container/stream metadata.<br>
-    Methods: M1 file size, M3 partial hash, M2 SHA-256, M4 ffprobe metadata.</li>
-  <li><b>Medium</b> — Easy + perceptual hash on sampled frames. Finds re-encoded,
-    resized or re-muxed copies that aren't byte-identical.<br>
-    Adds: M5 perceptual hash.</li>
-  <li><b>Robust</b> — Medium + frame-by-frame SSIM/PSNR and (optionally) VMAF, plus
-    audio fingerprinting. Most thorough; slowest.<br>
-    Adds: M6 SSIM, M7 PSNR, M8 VMAF, M9 audio fingerprint.</li>
+  <li><b>Easy</b> - fast. Finds exact / near-exact copies using file size,
+      a quick head+tail hash, full SHA-256, and ffprobe metadata.</li>
+  <li><b>Medium</b> - balanced. Everything in Easy plus perceptual hashing of
+      sampled frames, so it also catches re-encoded or resized copies.</li>
+  <li><b>Robust</b> - thorough but slow. Everything in Medium plus frame SSIM
+      and PSNR, optional VMAF, and audio fingerprinting. Expensive checks run
+      only on candidates that survive the cheaper filters.</li>
 </ul>
 
-<h3>Methods</h3>
-<dl>
-  <dt><b>M1 — File size</b></dt>
-  <dd>Instant pre-filter. Two files that aren't the same size obviously aren't byte-identical.</dd>
-  <dt><b>M2 — SHA-256 full hash</b></dt>
-  <dd>Proves byte-identical files. Slow on big files, but cached so repeat scans are fast.</dd>
-  <dt><b>M3 — Partial hash</b></dt>
-  <dd>SHA-256 of the first + last N bytes of the file plus its size. A great cheap filter.</dd>
-  <dt><b>M4 — ffprobe metadata</b></dt>
-  <dd>Compares duration, resolution, video codec, fps, audio codec, audio channels.</dd>
-  <dt><b>M5 — Perceptual hash (pHash)</b></dt>
-  <dd>Samples N frames from each video and hashes them with a perceptual hash. Two videos
-    match when the mean Hamming distance between their per-frame hashes is small enough.
-    Robust to re-encoding and resizing.</dd>
-  <dt><b>M6 — SSIM</b></dt>
-  <dd>Structural similarity index from ffmpeg's <code>ssim</code> filter (0..1). Same content
-    typically scores 0.95+.</dd>
-  <dt><b>M7 — PSNR</b></dt>
-  <dd>Peak signal-to-noise ratio (dB) via ffmpeg's <code>psnr</code> filter. Same content
-    typically scores 30 dB+ (identical = infinity).</dd>
-  <dt><b>M8 — VMAF</b></dt>
-  <dd>Netflix's perceptual quality score (0..100) via ffmpeg's <code>libvmaf</code>. Requires
-    an ffmpeg build with libvmaf. Same content typically scores 90+.</dd>
-  <dt><b>M9 — Audio fingerprint</b></dt>
-  <dd>Chromaprint audio fingerprint via the <code>fpcalc</code> tool. Catches files with the
-    same audio even if their video is encoded differently.</dd>
-</dl>
-
-<h3>Combination logic</h3>
-<p>Two files are considered duplicates when, depending on the "Match logic" setting:</p>
+<h3>Methods (toggle individually in Advanced)</h3>
 <ul>
-  <li><b>ANY</b> enabled method agrees (default — more matches), or</li>
-  <li><b>ALL</b> enabled methods agree (stricter — fewer matches).</li>
+  <li><b>M1 File size</b> - instant pre-filter grouping equal-sized files.</li>
+  <li><b>M2 SHA-256</b> - confirms byte-identical duplicates.</li>
+  <li><b>M3 Partial hash</b> - hashes the first+last bytes for a fast pre-check.</li>
+  <li><b>M4 Metadata</b> - compares duration, resolution, codec, bitrate, fps,
+      audio channels via ffprobe.</li>
+  <li><b>M5 Perceptual hash</b> - perceptual fingerprint of sampled frames;
+      matches within a Hamming-distance threshold.</li>
+  <li><b>M6 SSIM</b> - structural similarity of aligned frames (0-1).</li>
+  <li><b>M7 PSNR</b> - peak signal-to-noise ratio in dB.</li>
+  <li><b>M8 VMAF</b> - Netflix perceptual quality metric (needs libvmaf).</li>
+  <li><b>M9 Audio fingerprint</b> - Chromaprint match of the audio track.</li>
 </ul>
 
-<h3>Keep rule</h3>
-<p>For each duplicate group, VidComp picks one file to <b>keep</b> based on the
-selected rule (largest, newest, highest resolution, etc.). You can change the
-keeper for any group via right-click → "Set as keeper".</p>
+<h3>Match logic</h3>
+<p><b>ANY</b> flags a pair if a single enabled method agrees (more matches).
+<b>ALL</b> requires every enabled method to agree (fewer, stricter matches).</p>
 
-<h3>Deletion</h3>
-<p>Three delete modes are available:</p>
-<ul>
-  <li><b>Recycle Bin</b> — reversible, recommended.</li>
-  <li><b>Quarantine</b> — moves files to a folder of your choice for later review.</li>
-  <li><b>Permanent</b> — cannot be undone. Requires typed confirmation.</li>
-</ul>
-<p><b>Safety:</b> VidComp will never let you delete every file in a group; the
-keeper for each group is always protected.</p>
+<h3>Keep rule &amp; deletion</h3>
+<p>The keep rule decides which file is protected in each group (highest
+resolution, largest, longest, newest, oldest, or manual). "Select duplicates"
+checks everything except the kept file. Deletion can use the Recycle Bin, a
+quarantine folder, or permanent removal - VidComp never deletes every file in a
+group.</p>
 """
 
 
 class HelpDialog(QDialog):
-    def __init__(self, parent: Optional[QWidget] = None) -> None:
+    def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
-        self.setWindowTitle("VidComp — Help")
-        self.resize(640, 580)
+        self.setWindowTitle("VidComp - Help & About")
+        self.setMinimumSize(640, 560)
         layout = QVBoxLayout(self)
         browser = QTextBrowser()
         browser.setOpenExternalLinks(True)
         browser.setHtml(_HELP_HTML)
         layout.addWidget(browser, 1)
-        btns = QDialogButtonBox(QDialogButtonBox.Close)
-        btns.rejected.connect(self.reject)
-        btns.accepted.connect(self.accept)
-        btns.button(QDialogButtonBox.Close).clicked.connect(self.accept)
-        layout.addWidget(btns)
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok)
+        buttons.accepted.connect(self.accept)
+        layout.addWidget(buttons)

@@ -1,250 +1,201 @@
-"""Application configuration: persistent settings + scan-preset definitions.
+"""Application configuration, scan options and mode presets.
 
-The configuration is a single :class:`AppConfig` dataclass.  It can be
-serialised to JSON (``%APPDATA%/VidComp/config.json``) and reloaded.
-
-Presets (``easy``, ``medium``, ``robust``) populate the enabled-method set and
-thresholds; switching to ``custom`` lets the Advanced panel override anything.
+``ScanOptions`` describes a single scan (which methods run, thresholds, filters)
+and is consumed by the engine.  ``AppConfig`` holds persistent app-wide
+settings (delete mode, paths, worker count, ...).  Both serialise to JSON.
 """
 
 from __future__ import annotations
 
 import json
 import os
-import logging
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import List, Set
+from typing import Any
 
-LOG = logging.getLogger(__name__)
+from .core.models import DeleteMode, KeepRule, MatchLogic, MethodId, ScanMode
 
-# ---------------------------------------------------------------------------
-# Method id constants — kept here as plain strings so this module has no
-# import dependency on `vidcomp.core.methods` (avoids a circular import).
-# The registry in :mod:`vidcomp.core.methods` must use the same ids.
-# ---------------------------------------------------------------------------
-METHOD_SIZE = "size"
-METHOD_PARTIAL_HASH = "partial_hash"
-METHOD_SHA256 = "sha256"
-METHOD_METADATA = "metadata"
-METHOD_PHASH = "phash"
-METHOD_SSIM = "ssim"
-METHOD_PSNR = "psnr"
-METHOD_VMAF = "vmaf"
-METHOD_AUDIO = "audio"
-
-ALL_METHODS: List[str] = [
-    METHOD_SIZE,
-    METHOD_PARTIAL_HASH,
-    METHOD_SHA256,
-    METHOD_METADATA,
-    METHOD_PHASH,
-    METHOD_SSIM,
-    METHOD_PSNR,
-    METHOD_VMAF,
-    METHOD_AUDIO,
+# Default supported video extensions (lower-case, with leading dot).
+DEFAULT_EXTENSIONS: list[str] = [
+    ".mp4", ".mkv", ".avi", ".mov", ".wmv", ".flv", ".webm", ".m4v",
+    ".mpg", ".mpeg", ".3gp", ".ts", ".m2ts", ".vob", ".ogv",
 ]
 
-# Default video extensions (case-insensitive, stored without leading dot).
-DEFAULT_EXTENSIONS: List[str] = [
-    "mp4", "mkv", "avi", "mov", "wmv", "flv", "webm", "m4v",
-    "mpg", "mpeg", "3gp", "ts", "m2ts", "vob", "ogv",
-]
 
-# Preset names.
-PRESET_EASY = "easy"
-PRESET_MEDIUM = "medium"
-PRESET_ROBUST = "robust"
-PRESET_CUSTOM = "custom"
-ALL_PRESETS: List[str] = [PRESET_EASY, PRESET_MEDIUM, PRESET_ROBUST, PRESET_CUSTOM]
-
-# Delete modes.
-DELETE_RECYCLE = "recycle"
-DELETE_QUARANTINE = "quarantine"
-DELETE_PERMANENT = "permanent"
-
-# Keep-rule ids.
-KEEP_HIGHEST_RES = "highest_resolution"
-KEEP_LARGEST = "largest_size"
-KEEP_LONGEST = "longest_duration"
-KEEP_NEWEST = "newest"
-KEEP_OLDEST = "oldest"
-KEEP_MANUAL = "manual"
-ALL_KEEP_RULES: List[str] = [
-    KEEP_HIGHEST_RES,
-    KEEP_LARGEST,
-    KEEP_LONGEST,
-    KEEP_NEWEST,
-    KEEP_OLDEST,
-    KEEP_MANUAL,
-]
-
-# Match combination logic.
-MATCH_ANY = "any"
-MATCH_ALL = "all"
-
-
-def _appdata_root() -> Path:
-    """Return ``%APPDATA%/VidComp`` (created if missing)."""
-    base = os.environ.get("APPDATA") or str(Path.home() / "AppData" / "Roaming")
-    root = Path(base) / "VidComp"
-    root.mkdir(parents=True, exist_ok=True)
-    return root
-
-
-def default_config_path() -> Path:
-    return _appdata_root() / "config.json"
-
-
-def default_cache_path() -> Path:
-    return _appdata_root() / "cache.sqlite"
-
-
-def default_thumbnail_dir() -> Path:
-    d = _appdata_root() / "thumbnails"
-    d.mkdir(parents=True, exist_ok=True)
+def default_config_dir() -> Path:
+    """Per-user config directory (``%APPDATA%\\VidComp`` on Windows)."""
+    base = os.environ.get("APPDATA") or os.path.expanduser("~")
+    d = Path(base) / "VidComp"
     return d
 
 
-def default_quarantine_dir() -> Path:
-    d = _appdata_root() / "quarantine"
-    d.mkdir(parents=True, exist_ok=True)
-    return d
+def default_cache_dir() -> Path:
+    base = os.environ.get("LOCALAPPDATA") or os.environ.get("APPDATA") or os.path.expanduser("~")
+    return Path(base) / "VidComp" / "cache"
 
 
-def default_log_path() -> Path:
-    return _appdata_root() / "vidcomp.log"
+@dataclass
+class ScanOptions:
+    """Everything the engine needs to perform one scan.
+
+    ``enabled_methods`` is the authoritative set of active comparison methods.
+    The Easy/Medium/Robust presets simply pre-populate this set and the
+    thresholds; switching to ``CUSTOM`` lets the user override freely.
+    """
+
+    mode: ScanMode = ScanMode.EASY
+    enabled_methods: set[MethodId] = field(default_factory=set)
+    match_logic: MatchLogic = MatchLogic.ANY
+
+    # Thresholds (sensible defaults).
+    phash_threshold: int = 8          # max Hamming distance for a pHash match
+    frame_samples: int = 9            # frames sampled per video for pHash/SSIM
+    ssim_threshold: float = 0.92      # 0..1, higher == more similar
+    psnr_threshold: float = 30.0      # dB
+    vmaf_threshold: float = 90.0      # 0..100
+    audio_threshold: float = 0.85     # 0..1 fingerprint similarity
+    partial_hash_bytes: int = 1 << 20  # first+last N bytes for the quick hash
+
+    # Filters.
+    extensions: list[str] = field(default_factory=lambda: list(DEFAULT_EXTENSIONS))
+    min_size_bytes: int = 0
+    min_duration_seconds: float = 0.0
+
+    # Concurrency.
+    worker_count: int = max(2, (os.cpu_count() or 4))
+
+    def is_enabled(self, method: MethodId) -> bool:
+        return method in self.enabled_methods
+
+    def to_dict(self) -> dict[str, Any]:
+        d = asdict(self)
+        d["mode"] = self.mode.value
+        d["match_logic"] = self.match_logic.value
+        d["enabled_methods"] = sorted(m.value for m in self.enabled_methods)
+        return d
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> "ScanOptions":
+        opts = cls()
+        opts.mode = ScanMode(d.get("mode", ScanMode.EASY.value))
+        opts.match_logic = MatchLogic(d.get("match_logic", MatchLogic.ANY.value))
+        opts.enabled_methods = {MethodId(m) for m in d.get("enabled_methods", [])}
+        for key in (
+            "phash_threshold", "frame_samples", "ssim_threshold", "psnr_threshold",
+            "vmaf_threshold", "audio_threshold", "partial_hash_bytes",
+            "min_size_bytes", "min_duration_seconds", "worker_count",
+        ):
+            if key in d and d[key] is not None:
+                setattr(opts, key, d[key])
+        if d.get("extensions"):
+            opts.extensions = list(d["extensions"])
+        return opts
+
+
+# --- Mode -> method mapping (Section 3 of the spec) ------------------------
+
+_EASY_METHODS = {MethodId.SIZE, MethodId.PARTIAL_HASH, MethodId.SHA256, MethodId.METADATA}
+_MEDIUM_METHODS = _EASY_METHODS | {MethodId.PHASH}
+_ROBUST_METHODS = _MEDIUM_METHODS | {
+    MethodId.SSIM, MethodId.PSNR, MethodId.VMAF, MethodId.AUDIO,
+}
+
+PRESET_METHODS: dict[ScanMode, set[MethodId]] = {
+    ScanMode.EASY: set(_EASY_METHODS),
+    ScanMode.MEDIUM: set(_MEDIUM_METHODS),
+    ScanMode.ROBUST: set(_ROBUST_METHODS),
+}
+
+
+def options_for_mode(mode: ScanMode, base: ScanOptions | None = None) -> ScanOptions:
+    """Return a fresh ``ScanOptions`` pre-populated for the given preset.
+
+    Robust mode favours ALL-logic only loosely; per the spec the default
+    combination logic stays ANY so any single strong signal can flag a match,
+    while the expensive metrics act as confirming evidence.  Users can flip
+    this in the Advanced panel.
+    """
+
+    opts = ScanOptions() if base is None else base
+    opts.mode = mode
+    if mode in PRESET_METHODS:
+        opts.enabled_methods = set(PRESET_METHODS[mode])
+    return opts
 
 
 @dataclass
 class AppConfig:
     """Persistent application settings."""
 
-    # ---- scan presets / methods ----
-    preset: str = PRESET_MEDIUM
-    enabled_methods: Set[str] = field(default_factory=lambda: set())
-    match_logic: str = MATCH_ANY  # "any" or "all"
+    last_folder: str = ""
+    keep_rule: KeepRule = KeepRule.HIGHEST_RESOLUTION
+    delete_mode: DeleteMode = DeleteMode.RECYCLE_BIN
+    quarantine_folder: str = str(default_config_dir() / "quarantine")
+    cache_dir: str = str(default_cache_dir())
+    thumbnail_dir: str = str(default_cache_dir() / "thumbnails")
+    thumbnail_cache_mb: int = 512
+    worker_count: int = max(2, (os.cpu_count() or 4))
+    dark_mode: bool = True
+    scan_options: ScanOptions = field(default_factory=ScanOptions)
 
-    # ---- filtering ----
-    extensions: List[str] = field(default_factory=lambda: list(DEFAULT_EXTENSIONS))
-    min_file_size_bytes: int = 1024  # ignore < 1 KiB
-    min_duration_sec: float = 0.0
+    # --- persistence -------------------------------------------------------
+    @staticmethod
+    def config_path() -> Path:
+        return default_config_dir() / "config.json"
 
-    # ---- per-method thresholds / params ----
-    partial_hash_bytes: int = 1_048_576           # 1 MiB head + tail
-    phash_frames: int = 9                         # frames sampled per video
-    phash_threshold: int = 8                      # max mean Hamming distance (0..64)
-    ssim_threshold: float = 0.95                  # min SSIM
-    psnr_threshold: float = 30.0                  # min PSNR in dB
-    vmaf_threshold: float = 90.0                  # min VMAF (0..100)
-    audio_threshold: float = 0.85                 # min Chromaprint similarity (0..1)
-
-    metadata_duration_tolerance_sec: float = 0.5
-    metadata_fps_tolerance: float = 0.1
-
-    # ---- pair-explosion guard ----
-    max_pairs_per_bucket: int = 5000
-
-    # ---- worker / performance ----
-    worker_count: int = 4
-
-    # ---- deletion ----
-    delete_mode: str = DELETE_RECYCLE
-    quarantine_path: str = ""                     # filled in __post_init__
-    keep_rule: str = KEEP_HIGHEST_RES
-
-    # ---- paths ----
-    cache_path: str = ""
-    thumbnail_cache_path: str = ""
-    thumbnail_cache_max_bytes: int = 500 * 1024 * 1024  # 500 MB
-    log_path: str = ""
-
-    # ---- GUI ----
-    advanced_panel_open: bool = False
-    last_scan_folder: str = ""
-
-    def __post_init__(self) -> None:
-        if not self.enabled_methods:
-            self.enabled_methods = methods_for_preset(self.preset)
-        if not self.quarantine_path:
-            self.quarantine_path = str(default_quarantine_dir())
-        if not self.cache_path:
-            self.cache_path = str(default_cache_path())
-        if not self.thumbnail_cache_path:
-            self.thumbnail_cache_path = str(default_thumbnail_dir())
-        if not self.log_path:
-            self.log_path = str(default_log_path())
-
-    # ---- preset helpers ----
-    def apply_preset(self, preset: str) -> None:
-        """Switch to one of the named presets (overwrites the enabled-method set)."""
-        if preset == PRESET_CUSTOM:
-            self.preset = PRESET_CUSTOM
-            return
-        self.enabled_methods = methods_for_preset(preset)
-        # Easy mode uses ALL logic because every cheap method is an exact-equality
-        # check — requiring agreement gives correct exact-duplicate semantics.
-        # Medium/Robust use ANY so a single perceptual match (pHash, audio, etc.)
-        # is sufficient even if a cheap method (e.g. SHA-256) disagrees.
-        self.match_logic = MATCH_ALL if preset == PRESET_EASY else MATCH_ANY
-        self.preset = preset
-
-    def mark_custom(self) -> None:
-        """Flip the preset to ``custom`` (called when user toggles a method manually)."""
-        self.preset = PRESET_CUSTOM
-
-    # ---- persistence ----
-    def save(self, path: Path | None = None) -> Path:
-        path = path or default_config_path()
-        data = asdict(self)
-        data["enabled_methods"] = sorted(self.enabled_methods)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(data, indent=2), encoding="utf-8")
-        return path
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "last_folder": self.last_folder,
+            "keep_rule": self.keep_rule.value,
+            "delete_mode": self.delete_mode.value,
+            "quarantine_folder": self.quarantine_folder,
+            "cache_dir": self.cache_dir,
+            "thumbnail_dir": self.thumbnail_dir,
+            "thumbnail_cache_mb": self.thumbnail_cache_mb,
+            "worker_count": self.worker_count,
+            "dark_mode": self.dark_mode,
+            "scan_options": self.scan_options.to_dict(),
+        }
 
     @classmethod
-    def load(cls, path: Path | None = None) -> "AppConfig":
-        path = path or default_config_path()
-        if not path.exists():
-            return cls()
+    def from_dict(cls, d: dict[str, Any]) -> "AppConfig":
+        cfg = cls()
+        cfg.last_folder = d.get("last_folder", "")
+        if d.get("keep_rule"):
+            cfg.keep_rule = KeepRule(d["keep_rule"])
+        if d.get("delete_mode"):
+            cfg.delete_mode = DeleteMode(d["delete_mode"])
+        cfg.quarantine_folder = d.get("quarantine_folder", cfg.quarantine_folder)
+        cfg.cache_dir = d.get("cache_dir", cfg.cache_dir)
+        cfg.thumbnail_dir = d.get("thumbnail_dir", cfg.thumbnail_dir)
+        cfg.thumbnail_cache_mb = d.get("thumbnail_cache_mb", cfg.thumbnail_cache_mb)
+        cfg.worker_count = d.get("worker_count", cfg.worker_count)
+        cfg.dark_mode = d.get("dark_mode", cfg.dark_mode)
+        if d.get("scan_options"):
+            cfg.scan_options = ScanOptions.from_dict(d["scan_options"])
+        return cfg
+
+    @classmethod
+    def load(cls) -> "AppConfig":
+        """Load config from disk, falling back to defaults on any error."""
+        p = cls.config_path()
         try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError) as exc:
-            LOG.warning("Failed to load config %s: %s — using defaults", path, exc)
-            return cls()
+            if p.is_file():
+                with open(p, "r", encoding="utf-8") as fh:
+                    return cls.from_dict(json.load(fh))
+        except Exception:
+            pass
+        cfg = cls()
+        # Ensure the Easy preset is populated on first run.
+        cfg.scan_options = options_for_mode(ScanMode.EASY)
+        return cfg
 
-        # Normalise: enabled_methods may be a list on disk.
-        if isinstance(data.get("enabled_methods"), list):
-            data["enabled_methods"] = set(data["enabled_methods"])
-
-        # Drop any unknown keys so renames don't crash future builds.
-        valid = {f for f in cls.__dataclass_fields__}
-        clean = {k: v for k, v in data.items() if k in valid}
+    def save(self) -> None:
+        p = self.config_path()
         try:
-            return cls(**clean)
-        except TypeError as exc:
-            LOG.warning("Config schema mismatch (%s) — using defaults", exc)
-            return cls()
-
-
-def methods_for_preset(preset: str) -> Set[str]:
-    """Plain-string variant of the per-preset method set (no method imports)."""
-    preset = preset.lower()
-    easy = {METHOD_SIZE, METHOD_PARTIAL_HASH, METHOD_SHA256, METHOD_METADATA}
-    if preset == PRESET_EASY:
-        return set(easy)
-    if preset == PRESET_MEDIUM:
-        return easy | {METHOD_PHASH}
-    if preset == PRESET_ROBUST:
-        return easy | {METHOD_PHASH, METHOD_SSIM, METHOD_PSNR, METHOD_VMAF, METHOD_AUDIO}
-    if preset == PRESET_CUSTOM:
-        return easy | {METHOD_PHASH}
-    raise ValueError(f"Unknown preset: {preset!r}")
-
-
-def detect_preset_from_methods(methods: Set[str]) -> str:
-    """Reverse-lookup: if ``methods`` matches a named preset exactly, return it."""
-    for preset in (PRESET_EASY, PRESET_MEDIUM, PRESET_ROBUST):
-        if methods == methods_for_preset(preset):
-            return preset
-    return PRESET_CUSTOM
+            p.parent.mkdir(parents=True, exist_ok=True)
+            with open(p, "w", encoding="utf-8") as fh:
+                json.dump(self.to_dict(), fh, indent=2)
+        except Exception:
+            # Settings persistence is best-effort; never crash the app.
+            pass

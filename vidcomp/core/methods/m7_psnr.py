@@ -1,64 +1,38 @@
-"""M7 — PSNR (peak signal-to-noise ratio) via ffmpeg ``psnr`` filter."""
+"""M7 - Peak Signal-to-Noise Ratio (PSNR) on aligned frames via ffmpeg."""
 
 from __future__ import annotations
 
-import logging
-from typing import Any, Optional
+from typing import Optional
 
-from ...config import METHOD_PSNR
-from .. import media
-from ..models import MatchEvidence, VideoFile
+from ..models import MatchEvidence, MethodId, VideoFile
 from .base import ComparisonMethod, MethodContext
-from .m4_metadata import get_or_fetch_metadata
-
-LOG = logging.getLogger(__name__)
+from .m6_ssim import get_ssim_psnr
 
 
 class PsnrMethod(ComparisonMethod):
-    id = METHOD_PSNR
-    display_name = "PSNR (peak signal-to-noise ratio)"
-    kind = "pairwise"
-    description = (
-        "Peak signal-to-noise ratio in dB.  Identical inputs hit infinity; "
-        "values above ~30 dB usually indicate the same content."
-    )
+    """Match when the mean PSNR (dB) exceeds a configurable threshold."""
 
-    def evaluate_pair(
-        self,
-        a: VideoFile,
-        b: VideoFile,
-        sig_a: Optional[Any],
-        sig_b: Optional[Any],
-        ctx: MethodContext,
-    ) -> MatchEvidence:
-        threshold = float(getattr(ctx.config, "psnr_threshold", 30.0))
-        cached = ctx.cache.get_pair(a.path, b.path, a.mtime, b.mtime, self.id)
-        if cached is not None:
-            return self._evidence(cached, threshold)
-        md_a = get_or_fetch_metadata(a, ctx)
-        md_b = get_or_fetch_metadata(b, ctx)
-        if ctx.is_cancelled():
-            return MatchEvidence(
-                self.id, False, 0.0, detail="cancelled", abstain=True
-            )
-        score = media.run_psnr(
-            a.path, b.path,
-            duration_a=(md_a.duration_sec if md_a else None),
-            duration_b=(md_b.duration_sec if md_b else None),
-            cancel_event=ctx.cancel_event,
-        )
-        if score is None:
-            return MatchEvidence(
-                self.id, False, 0.0, detail="psnr failed", abstain=True
-            )
-        ctx.cache.put_pair(a.path, b.path, a.mtime, b.mtime, self.id, score)
-        return self._evidence(score, threshold)
+    method_id = MethodId.PSNR
+    expensive = True
+    needs_tools = True
 
-    def _evidence(self, score: float, threshold: float) -> MatchEvidence:
-        return MatchEvidence(
-            method_id=self.id,
-            matched=score >= threshold,
-            score=score,
-            detail=f"psnr={score:.2f}dB ≥ {threshold:.1f}dB" if score >= threshold
-                   else f"psnr={score:.2f}dB < {threshold:.1f}dB",
-        )
+    def available(self, ctx: MethodContext) -> bool:
+        return ctx.tools.has_ffmpeg
+
+    def compare(
+        self, a: VideoFile, b: VideoFile, ctx: MethodContext
+    ) -> Optional[MatchEvidence]:
+        _ssim, psnr = get_ssim_psnr(a, b, ctx)
+        if psnr is None:
+            return None
+        threshold = float(getattr(ctx.options, "psnr_threshold", 30.0))
+        if psnr >= threshold:
+            # Normalize: 50 dB+ is effectively identical for an 8-bit signal.
+            score = min(1.0, psnr / 50.0) if psnr != float("inf") else 1.0
+            shown = "inf" if psnr == float("inf") else f"{psnr:.1f}"
+            return MatchEvidence(
+                method=MethodId.PSNR,
+                score=round(score, 3),
+                detail=f"PSNR {shown} dB >= {threshold:.1f}",
+            )
+        return None

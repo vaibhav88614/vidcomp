@@ -1,131 +1,107 @@
-"""Recursive folder walker for video files.
+"""Recursive video-file discovery.
 
-Uses :func:`os.scandir` for speed; gracefully skips files we can't ``stat``
-(permission errors, races, unsupported names, etc.).  On Windows, files with
-paths longer than ``MAX_PATH`` (260 chars) are still readable because the
-``\\\\?\\`` prefix is applied transparently when needed.
+Walks a folder tree, filters by configurable extension and minimum-size, and
+yields :class:`VideoFile` records.  Unreadable entries are skipped and reported
+through an optional callback rather than aborting the whole scan.
 """
 
 from __future__ import annotations
 
 import logging
 import os
-import sys
-from pathlib import Path
-from typing import Callable, Iterable, Iterator, Optional, Set
+from typing import Callable, Iterable, Iterator, Optional
 
 from .models import VideoFile
 
-LOG = logging.getLogger(__name__)
+log = logging.getLogger("vidcomp.scanner")
+
+ErrorCallback = Callable[[str, str], None]  # (path, message)
 
 
-def _normalise_extensions(extensions: Iterable[str]) -> Set[str]:
-    out: Set[str] = set()
-    for e in extensions:
-        e = e.strip().lower().lstrip(".")
-        if e:
-            out.add(e)
-    return out
-
-
-def _windows_long_path(path: str) -> str:
-    """Apply the ``\\\\?\\`` long-path prefix on Windows for paths >= 260 chars."""
-    if sys.platform != "win32":
-        return path
-    if path.startswith("\\\\?\\"):
-        return path
-    if len(path) < 250:
-        return path
-    if path.startswith("\\\\"):
-        # UNC path → \\?\UNC\server\share\...
-        return "\\\\?\\UNC\\" + path.lstrip("\\")
-    return "\\\\?\\" + path
-
-
-def walk_directory(
-    root: str | Path,
+def discover_videos(
+    root: str,
     extensions: Iterable[str],
-    min_file_size_bytes: int = 0,
-    cancel_check: Optional[Callable[[], bool]] = None,
-    on_skip: Optional[Callable[[str, str], None]] = None,
+    min_size_bytes: int = 0,
+    on_error: Optional[ErrorCallback] = None,
+    is_cancelled: Optional[Callable[[], bool]] = None,
 ) -> Iterator[VideoFile]:
-    """Yield :class:`VideoFile` for every matching file under *root* recursively.
+    """Yield :class:`VideoFile` for every matching file under ``root``.
 
-    Parameters
-    ----------
-    root:
-        Folder to scan.
-    extensions:
-        Iterable of extensions (with or without leading dot, case-insensitive).
-    min_file_size_bytes:
-        Files smaller than this are skipped (helps ignore stub/placeholder files).
-    cancel_check:
-        Optional callable returning ``True`` if scanning should stop early.
-    on_skip:
-        Optional callback ``(path, reason)`` invoked for files we couldn't read.
+    ``extensions`` are matched case-insensitively and may be given with or
+    without a leading dot.  Files smaller than ``min_size_bytes`` (including
+    zero-byte files) are skipped.
     """
-    root_path = Path(root)
-    if not root_path.exists() or not root_path.is_dir():
-        LOG.warning("Scan root does not exist or is not a directory: %s", root_path)
-        return
+    norm_exts = {
+        ("." + e.lower().lstrip(".")) for e in extensions if e
+    }
+    log.info(
+        "Discovering videos under %s (exts=%s, min_size=%d bytes)",
+        root, sorted(norm_exts), min_size_bytes,
+    )
+    yielded = 0
+    skipped = 0
 
-    allowed = _normalise_extensions(extensions)
-    if not allowed:
-        return
-
-    stack = [str(root_path)]
-    while stack:
-        if cancel_check is not None and cancel_check():
+    for dirpath, dirnames, filenames in os.walk(root, onerror=_walk_error(on_error)):
+        if is_cancelled and is_cancelled():
+            log.info("Discovery cancelled after %d file(s)", yielded)
             return
-        current = stack.pop()
-        try:
-            it = os.scandir(_windows_long_path(current))
-        except (PermissionError, OSError) as exc:
-            if on_skip:
-                on_skip(current, f"cannot list directory: {exc}")
-            continue
-        try:
-            for entry in it:
-                if cancel_check is not None and cancel_check():
-                    return
-                try:
-                    if entry.is_dir(follow_symlinks=False):
-                        stack.append(entry.path)
-                        continue
-                    if not entry.is_file(follow_symlinks=False):
-                        continue
-                    name = entry.name
-                    dot = name.rfind(".")
-                    if dot < 0:
-                        continue
-                    ext = name[dot + 1:].lower()
-                    if ext not in allowed:
-                        continue
-                    try:
-                        st = entry.stat(follow_symlinks=False)
-                    except OSError as exc:
-                        if on_skip:
-                            on_skip(entry.path, f"stat failed: {exc}")
-                        continue
-                    if st.st_size < min_file_size_bytes:
-                        continue
-                    # Re-canonicalise the path to drop the long-path prefix.
-                    p = entry.path
-                    if p.startswith("\\\\?\\"):
-                        p = p[4:]
-                        if p.startswith("UNC\\"):
-                            p = "\\\\" + p[4:]
-                    yield VideoFile(
-                        path=p,
-                        size=st.st_size,
-                        mtime=st.st_mtime,
-                        ctime=st.st_ctime,
-                    )
-                except OSError as exc:
-                    if on_skip:
-                        on_skip(getattr(entry, "path", "?"), f"entry error: {exc}")
-        finally:
+        log.debug("walk: %s (%d files)", dirpath, len(filenames))
+        for fname in filenames:
+            if is_cancelled and is_cancelled():
+                log.info("Discovery cancelled after %d file(s)", yielded)
+                return
+            ext = os.path.splitext(fname)[1].lower()
+            if ext not in norm_exts:
+                continue
+            full = os.path.join(dirpath, fname)
             try:
-                it.close()
-            except Exception:  # noqa: BLE001
-                pass
+                st = os.stat(full)
+            except OSError as exc:
+                _report(on_error, full, f"stat failed: {exc}")
+                skipped += 1
+                continue
+            if st.st_size <= 0:
+                _report(on_error, full, "zero-byte file skipped")
+                skipped += 1
+                continue
+            if st.st_size < min_size_bytes:
+                skipped += 1
+                continue
+            yielded += 1
+            yield VideoFile(
+                path=full,
+                size=st.st_size,
+                mtime=st.st_mtime,
+                ctime=getattr(st, "st_ctime", st.st_mtime),
+            )
+
+    log.info("Discovery finished: %d kept, %d skipped", yielded, skipped)
+
+
+def collect_videos(
+    root: str,
+    extensions: Iterable[str],
+    min_size_bytes: int = 0,
+    on_error: Optional[ErrorCallback] = None,
+    is_cancelled: Optional[Callable[[], bool]] = None,
+) -> list[VideoFile]:
+    """Eager wrapper around :func:`discover_videos`."""
+    return list(
+        discover_videos(root, extensions, min_size_bytes, on_error, is_cancelled)
+    )
+
+
+def _walk_error(on_error: Optional[ErrorCallback]):
+    def handler(exc: OSError) -> None:
+        path = getattr(exc, "filename", "") or ""
+        _report(on_error, path, f"directory walk error: {exc}")
+    return handler
+
+
+def _report(on_error: Optional[ErrorCallback], path: str, message: str) -> None:
+    log.debug("%s: %s", path, message)
+    if on_error:
+        try:
+            on_error(path, message)
+        except Exception:
+            pass

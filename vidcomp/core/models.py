@@ -1,21 +1,120 @@
-"""Typed dataclasses shared across the engine and the GUI.
+"""Core data models shared between the engine and the GUI.
 
-All models are intentionally framework-free (no Qt imports) so the engine and
-the test-suite can use them without bringing PySide6 into scope.
+These dataclasses are intentionally free of any Qt or GUI dependency so the
+engine can be unit-tested and reused in headless contexts.
 """
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
-from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from enum import Enum
+from typing import Optional
 
 
-@dataclass(frozen=True)
+class ScanMode(str, Enum):
+    """The three high-level scan presets exposed in the UI."""
+
+    EASY = "easy"
+    MEDIUM = "medium"
+    ROBUST = "robust"
+    CUSTOM = "custom"
+
+
+class MatchLogic(str, Enum):
+    """How results from individual methods are combined for a pair."""
+
+    ANY = "any"  # a pair matches if ANY enabled method agrees
+    ALL = "all"  # a pair matches only if ALL enabled methods agree
+
+
+class KeepRule(str, Enum):
+    """Which file to protect (keep) in each duplicate group."""
+
+    HIGHEST_RESOLUTION = "highest_resolution"
+    LARGEST_SIZE = "largest_size"
+    LONGEST_DURATION = "longest_duration"
+    NEWEST = "newest"
+    OLDEST = "oldest"
+    MANUAL = "manual"
+
+
+class DeleteMode(str, Enum):
+    """How selected files are removed."""
+
+    RECYCLE_BIN = "recycle_bin"
+    QUARANTINE = "quarantine"
+    PERMANENT = "permanent"
+
+
+class MethodId(str, Enum):
+    """Stable identifiers for the nine comparison methods (M1-M9)."""
+
+    SIZE = "size"  # M1
+    SHA256 = "sha256"  # M2
+    PARTIAL_HASH = "partial_hash"  # M3
+    METADATA = "metadata"  # M4
+    PHASH = "phash"  # M5
+    SSIM = "ssim"  # M6
+    PSNR = "psnr"  # M7
+    VMAF = "vmaf"  # M8
+    AUDIO = "audio"  # M9
+
+
+# Human-friendly labels used by the GUI and help text.
+METHOD_LABELS: dict[MethodId, str] = {
+    MethodId.SIZE: "M1 - File size",
+    MethodId.SHA256: "M2 - SHA-256 full hash",
+    MethodId.PARTIAL_HASH: "M3 - Partial/quick hash",
+    MethodId.METADATA: "M4 - Metadata (ffprobe)",
+    MethodId.PHASH: "M5 - Perceptual hash",
+    MethodId.SSIM: "M6 - SSIM",
+    MethodId.PSNR: "M7 - PSNR",
+    MethodId.VMAF: "M8 - VMAF",
+    MethodId.AUDIO: "M9 - Audio fingerprint",
+}
+
+
+@dataclass
+class MediaInfo:
+    """Container/stream metadata extracted via ffprobe.
+
+    All fields are optional because corrupt or exotic files may be missing
+    some streams.  ``ok`` indicates whether ffprobe produced usable output.
+    """
+
+    duration: Optional[float] = None  # seconds
+    width: Optional[int] = None
+    height: Optional[int] = None
+    video_codec: Optional[str] = None
+    audio_codec: Optional[str] = None
+    bitrate: Optional[int] = None  # bits per second
+    fps: Optional[float] = None
+    audio_channels: Optional[int] = None
+    has_video: bool = False
+    has_audio: bool = False
+    ok: bool = False
+
+    @property
+    def resolution(self) -> Optional[tuple[int, int]]:
+        if self.width and self.height:
+            return (self.width, self.height)
+        return None
+
+    @property
+    def pixels(self) -> int:
+        """Total pixel count, useful for the 'highest resolution' keep rule."""
+        if self.width and self.height:
+            return self.width * self.height
+        return 0
+
+
+@dataclass
 class VideoFile:
-    """A discovered video file on disk.
+    """A single discovered video file plus all cached signatures.
 
-    Equality is on the canonicalised path so we can de-dup the scanner output.
+    Signatures (hashes, perceptual hashes, fingerprints) are filled in lazily
+    by the engine and cached on disk keyed by ``(path, size, mtime)``.
     """
 
     path: str
@@ -23,188 +122,75 @@ class VideoFile:
     mtime: float
     ctime: float
 
-    @property
-    def as_path(self) -> Path:
-        return Path(self.path)
+    # Lazily-computed signatures.
+    info: Optional[MediaInfo] = None
+    sha256: Optional[str] = None
+    partial_hash: Optional[str] = None
+    phashes: Optional[list[str]] = None  # hex perceptual hashes per sampled frame
+    audio_fingerprint: Optional[str] = None
+    audio_fp_duration: Optional[float] = None
+
+    thumbnail_path: Optional[str] = None
+    error: Optional[str] = None  # populated if the file could not be processed
 
     @property
     def name(self) -> str:
-        return self.as_path.name
+        return os.path.basename(self.path)
 
     @property
-    def parent(self) -> str:
-        return str(self.as_path.parent)
-
-
-@dataclass
-class MediaMetadata:
-    """Container-level + first-video-stream + first-audio-stream metadata.
-
-    Any field may be ``None`` if ffprobe could not determine it.  We keep the
-    raw ffprobe JSON around for debugging/future use.
-    """
-
-    duration_sec: Optional[float] = None
-    width: Optional[int] = None
-    height: Optional[int] = None
-    video_codec: Optional[str] = None
-    bit_rate: Optional[int] = None
-    fps: Optional[float] = None
-    audio_codec: Optional[str] = None
-    audio_channels: Optional[int] = None
-    audio_sample_rate: Optional[int] = None
-    has_video: bool = False
-    has_audio: bool = False
-    raw_json: Optional[str] = None
+    def folder(self) -> str:
+        return os.path.dirname(self.path)
 
     @property
-    def resolution(self) -> Optional[Tuple[int, int]]:
-        if self.width and self.height:
-            return (self.width, self.height)
-        return None
-
-    @property
-    def resolution_str(self) -> str:
-        if self.resolution:
-            return f"{self.width}x{self.height}"
-        return "?"
+    def key(self) -> tuple[str, int, int]:
+        """Cache key: path + size + integer mtime."""
+        return (self.path, self.size, int(self.mtime))
 
 
 @dataclass
 class MatchEvidence:
-    """A single comparison method's verdict for an ordered pair of files."""
+    """Why two files were considered a match by a single method."""
 
-    method_id: str
-    matched: bool
-    score: float                       # method-specific (0..1, 0..100, dB, distance)
-    detail: Optional[str] = None
-    abstain: bool = False              # True ⇒ method couldn't decide (missing sig, error)
-
-
-@dataclass
-class PairResult:
-    """All evidence for an unordered pair of files plus the final verdict."""
-
-    path_a: str
-    path_b: str
-    evidences: List[MatchEvidence] = field(default_factory=list)
-    matched: bool = False              # final decision after ANY/ALL combination
-
-    def methods_that_matched(self) -> List[str]:
-        return [e.method_id for e in self.evidences if e.matched]
+    method: MethodId
+    score: float  # normalized 0..1 similarity (1.0 == identical)
+    detail: str = ""
 
 
 @dataclass
 class DuplicateGroup:
-    """A cluster of files that the engine considers duplicates / similar.
+    """A cluster of files detected as the same/similar content."""
 
-    ``keeper_path`` is the file selected by the active keep-rule.  ``files``
-    are guaranteed to be at least two and to all live in the same equivalence
-    class produced by union-find over agreeing pairs.
-    """
-
-    group_id: int
-    files: List[VideoFile]
-    keeper_path: Optional[str] = None
-    pair_scores: Dict[Tuple[str, str], PairResult] = field(default_factory=dict)
-
-    def reclaimable_bytes(self) -> int:
-        """Sum of sizes for every non-keeper file."""
-        return sum(f.size for f in self.files if f.path != self.keeper_path)
-
-    def matched_methods_for(self, path: str) -> List[str]:
-        """Methods that ever flagged the given file vs *any* other file in this group."""
-        seen: set[str] = set()
-        for (a, b), pr in self.pair_scores.items():
-            if path in (a, b):
-                seen.update(pr.methods_that_matched())
-        return sorted(seen)
-
-
-@dataclass
-class ScanProgress:
-    """Progress payload pushed from the scan worker to the UI."""
-
-    stage: str                         # human-readable label
-    current: int = 0
-    total: int = 0
-    current_file: str = ""
-    elapsed_sec: float = 0.0
-    eta_sec: float = 0.0
-    skipped: int = 0
-    note: str = ""
+    files: list[VideoFile] = field(default_factory=list)
+    # path -> list of evidence entries that linked it into the group.
+    evidence: dict[str, list[MatchEvidence]] = field(default_factory=dict)
+    keep_path: Optional[str] = None  # path the app recommends keeping
 
     @property
-    def fraction(self) -> float:
-        if self.total <= 0:
-            return 0.0
-        return min(1.0, self.current / self.total)
+    def total_size(self) -> int:
+        return sum(f.size for f in self.files)
+
+    @property
+    def reclaimable(self) -> int:
+        """Bytes that could be freed if all but the kept file were deleted."""
+        if not self.files:
+            return 0
+        keep = self.keep_path or (self.files[0].path if self.files else None)
+        return sum(f.size for f in self.files if f.path != keep)
+
+    def methods_for(self, path: str) -> list[MethodId]:
+        seen: list[MethodId] = []
+        for ev in self.evidence.get(path, []):
+            if ev.method not in seen:
+                seen.append(ev.method)
+        return seen
 
 
 @dataclass
 class DeletionResult:
-    """Outcome of attempting to delete one file."""
+    """Outcome of a single file deletion."""
 
     path: str
-    ok: bool
+    success: bool
+    mode: DeleteMode
     error: Optional[str] = None
-    target: Optional[str] = None       # quarantine destination, etc.
-
-
-@dataclass
-class DeletionReport:
-    """Aggregate report returned by :class:`vidcomp.core.deletion`."""
-
-    mode: str
-    results: List[DeletionResult] = field(default_factory=list)
-    bytes_reclaimed: int = 0
-
-    @property
-    def succeeded(self) -> List[DeletionResult]:
-        return [r for r in self.results if r.ok]
-
-    @property
-    def failed(self) -> List[DeletionResult]:
-        return [r for r in self.results if not r.ok]
-
-
-@dataclass
-class ToolStatus:
-    """Result of probing for an external CLI tool."""
-
-    name: str
-    path: Optional[str]
-    version: Optional[str] = None
-    available: bool = False
-    error: Optional[str] = None
-
-    @classmethod
-    def missing(cls, name: str, error: str = "not found on PATH") -> "ToolStatus":
-        return cls(name=name, path=None, version=None, available=False, error=error)
-
-
-@dataclass
-class ToolsStatus:
-    """Bundle of statuses for every external tool VidComp may use."""
-
-    ffmpeg: ToolStatus
-    ffprobe: ToolStatus
-    fpcalc: ToolStatus
-    libvmaf: bool = False
-
-    @property
-    def required_ok(self) -> bool:
-        return self.ffmpeg.available and self.ffprobe.available
-
-    @property
-    def missing_required(self) -> List[str]:
-        return [t.name for t in (self.ffmpeg, self.ffprobe) if not t.available]
-
-    @property
-    def missing_optional(self) -> List[str]:
-        missing: List[str] = []
-        if not self.fpcalc.available:
-            missing.append(self.fpcalc.name)
-        if not self.libvmaf:
-            missing.append("libvmaf (ffmpeg)")
-        return missing
+    destination: Optional[str] = None  # for quarantine moves

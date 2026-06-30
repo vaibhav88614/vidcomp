@@ -1,64 +1,44 @@
-"""M6 — SSIM (structural similarity) via ffmpeg ``ssim`` filter."""
+"""M6 - Structural Similarity (SSIM) on sampled/aligned frames via ffmpeg."""
 
 from __future__ import annotations
 
-import logging
-from typing import Any, Optional
+from typing import Optional, Tuple
 
-from ...config import METHOD_SSIM
-from .. import media
-from ..models import MatchEvidence, VideoFile
+from ..models import MatchEvidence, MethodId, VideoFile
 from .base import ComparisonMethod, MethodContext
-from .m4_metadata import get_or_fetch_metadata
 
-LOG = logging.getLogger(__name__)
+
+def get_ssim_psnr(a: VideoFile, b: VideoFile, ctx: MethodContext) -> Tuple[Optional[float], Optional[float]]:
+    """Memoized SSIM+PSNR for a pair so M6 and M7 share one ffmpeg run."""
+    key = frozenset((a.path, b.path))
+    if key in ctx.pair_cache:
+        return ctx.pair_cache[key]
+    result = ctx.tools.ssim_psnr(a.path, b.path)
+    ctx.pair_cache[key] = result
+    return result
 
 
 class SsimMethod(ComparisonMethod):
-    id = METHOD_SSIM
-    display_name = "SSIM (structural similarity)"
-    kind = "pairwise"
-    description = (
-        "Frame-by-frame structural similarity computed by ffmpeg's `ssim` filter. "
-        "Higher is more similar (max 1.0)."
-    )
+    """Match when the mean SSIM across compared frames exceeds a threshold."""
 
-    def evaluate_pair(
-        self,
-        a: VideoFile,
-        b: VideoFile,
-        sig_a: Optional[Any],
-        sig_b: Optional[Any],
-        ctx: MethodContext,
-    ) -> MatchEvidence:
-        threshold = float(getattr(ctx.config, "ssim_threshold", 0.95))
-        cached = ctx.cache.get_pair(a.path, b.path, a.mtime, b.mtime, self.id)
-        if cached is not None:
-            return self._evidence(cached, threshold)
-        md_a = get_or_fetch_metadata(a, ctx)
-        md_b = get_or_fetch_metadata(b, ctx)
-        if ctx.is_cancelled():
-            return MatchEvidence(
-                self.id, False, 0.0, detail="cancelled", abstain=True
-            )
-        score = media.run_ssim(
-            a.path, b.path,
-            duration_a=(md_a.duration_sec if md_a else None),
-            duration_b=(md_b.duration_sec if md_b else None),
-            cancel_event=ctx.cancel_event,
-        )
-        if score is None:
-            return MatchEvidence(
-                self.id, False, 0.0, detail="ssim failed", abstain=True
-            )
-        ctx.cache.put_pair(a.path, b.path, a.mtime, b.mtime, self.id, score)
-        return self._evidence(score, threshold)
+    method_id = MethodId.SSIM
+    expensive = True
+    needs_tools = True
 
-    def _evidence(self, score: float, threshold: float) -> MatchEvidence:
-        return MatchEvidence(
-            method_id=self.id,
-            matched=score >= threshold,
-            score=score,
-            detail=f"ssim={score:.4f} ≥ {threshold:.2f}" if score >= threshold
-                   else f"ssim={score:.4f} < {threshold:.2f}",
-        )
+    def available(self, ctx: MethodContext) -> bool:
+        return ctx.tools.has_ffmpeg
+
+    def compare(
+        self, a: VideoFile, b: VideoFile, ctx: MethodContext
+    ) -> Optional[MatchEvidence]:
+        ssim, _psnr = get_ssim_psnr(a, b, ctx)
+        if ssim is None:
+            return None
+        threshold = float(getattr(ctx.options, "ssim_threshold", 0.92))
+        if ssim >= threshold:
+            return MatchEvidence(
+                method=MethodId.SSIM,
+                score=round(min(1.0, ssim), 3),
+                detail=f"SSIM {ssim:.3f} >= {threshold:.3f}",
+            )
+        return None
