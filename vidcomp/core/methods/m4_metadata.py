@@ -1,8 +1,22 @@
 """M4 - Metadata comparison via ffprobe.
 
 Compares duration, resolution, codec, bitrate, fps and audio channels with
-sensible tolerances.  This catches exact copies and near-exact remuxes and also
-acts as a cheap gate before perceptual/structural comparisons.
+sensible tolerances.  Catches exact copies and near-exact remuxes / re-encodes
+and also acts as a cheap gate before perceptual/structural comparisons.
+
+To avoid false positives where two completely unrelated clips happen to share a
+duration (e.g. two 30-minute 1080p H.264 episodes from different shows), this
+method requires *all* of the following before declaring a match:
+
+* duration agrees within tolerance (the strongest single metadata signal);
+* **resolution is identical** (a real duplicate / re-encode never changes
+  aspect or pixel dimensions silently — and if it does, M5 pHash / M6 SSIM
+  will catch it instead);
+* at least **two additional** attributes agree from {codec, fps,
+  audio channels, bitrate-within-10 %}.
+
+That floor (4 matching attributes including duration + resolution) keeps every
+intentional remux / re-encode case while rejecting accidental coincidences.
 """
 
 from __future__ import annotations
@@ -39,43 +53,49 @@ class MetadataMethod(ComparisonMethod):
         if not ia or not ib or not ia.ok or not ib.ok:
             return None
 
-        # Duration is the strongest single metadata signal.
+        # Hard gate 1: duration must agree (strongest single signal).
         if not _duration_close(ia.duration, ib.duration):
+            return None
+
+        # Hard gate 2: resolution must be identical when both are known.
+        # If either side lacks resolution info we cannot use this as a gate,
+        # but we also cannot count it as a match — fall through and require
+        # extra attributes from the secondary list instead.
+        resolution_known = bool(ia.resolution and ib.resolution)
+        if resolution_known and ia.resolution != ib.resolution:
             return None
 
         matches: list[str] = ["duration"]
         score_parts: list[float] = [1.0]
 
-        if ia.resolution and ib.resolution:
-            if ia.resolution == ib.resolution:
-                matches.append("resolution")
-                score_parts.append(1.0)
-            else:
-                score_parts.append(0.5)
-
-        if ia.video_codec and ib.video_codec:
-            if ia.video_codec == ib.video_codec:
-                matches.append("codec")
-                score_parts.append(1.0)
-            else:
-                score_parts.append(0.6)
-
-        if ia.fps and ib.fps and abs(ia.fps - ib.fps) <= 0.5:
-            matches.append("fps")
+        if resolution_known:
+            matches.append("resolution")
             score_parts.append(1.0)
 
-        if ia.audio_channels and ib.audio_channels and ia.audio_channels == ib.audio_channels:
-            matches.append("audio-ch")
-
+        # Secondary attributes — at least two of these must agree.
+        secondary: list[str] = []
+        if ia.video_codec and ib.video_codec and ia.video_codec == ib.video_codec:
+            secondary.append("codec")
+        if ia.fps and ib.fps and abs(ia.fps - ib.fps) <= 0.5:
+            secondary.append("fps")
+        if (
+            ia.audio_channels
+            and ib.audio_channels
+            and ia.audio_channels == ib.audio_channels
+        ):
+            secondary.append("audio-ch")
         if ia.bitrate and ib.bitrate:
             hi = max(ia.bitrate, ib.bitrate)
             if hi and abs(ia.bitrate - ib.bitrate) / hi <= 0.1:
-                matches.append("bitrate")
+                secondary.append("bitrate")
+
+        if len(secondary) < 2:
+            return None
+
+        matches.extend(secondary)
+        score_parts.extend([1.0] * len(secondary))
 
         score = sum(score_parts) / len(score_parts)
-        # Require at least duration + one more attribute to call it a match.
-        if len(matches) < 2:
-            return None
         return MatchEvidence(
             method=MethodId.METADATA,
             score=round(score, 3),

@@ -19,7 +19,9 @@ from ... import __version__
 _ABOUT = f"""
 <h2>VidComp {__version__}</h2>
 <p>A GUI video duplicate / similarity comparer for Windows.</p>
-<p>Built with PySide6, OpenCV, imagehash, ffmpeg/ffprobe and Chromaprint.</p>
+<p>Built with PySide6, OpenCV, NumPy, Pillow, ffmpeg/ffprobe and Chromaprint.</p>
+<p style='color:#888888'>Perceptual hashing (M5) is built in using OpenCV + NumPy &mdash;
+no separate <code>phash</code> or <code>imagehash</code> package is required.</p>
 <p style='color:#888888'>This program is provided as-is without warranty.</p>
 """
 

@@ -3,13 +3,19 @@
 # version, install the closest available release (see README troubleshooting).
 
 PySide6==6.8.1.1          # Qt for Python GUI
-opencv-python==4.11.0.86  # frame sampling / image processing
-numpy==2.2.1              # array math (used by OpenCV / imagehash)
-Pillow==11.1.0            # image loading for perceptual hashing
-imagehash==4.3.1          # perceptual hashing (pHash) + Hamming distance
+opencv-python==4.11.0.86  # frame sampling / image processing / built-in pHash
+numpy==2.2.1              # array math (used by OpenCV and the built-in pHash)
+Pillow==11.1.0            # image loading fallback for perceptual hashing
 send2trash==1.8.3         # Recycle Bin deletion
 
 # --- optional, enable extra capabilities ---------------------------------
+# imagehash is NOT required. VidComp ships its own pHash implementation that
+# uses only OpenCV + NumPy (above), so the perceptual-hash method (M5) works
+# out of the box on Windows without needing the upstream `phash` C++ library
+# (which fails to build on most Windows installs) or `scipy`. If imagehash is
+# already installed in your environment it will be used as a drop-in
+# accelerator, otherwise the built-in path is used automatically.
+# imagehash==4.3.1
 pyacoustid==1.3.0         # Chromaprint/AcoustID Python wrapper (M9 audio)
 scikit-image==0.25.0      # optional SSIM fallback (ffmpeg lavfi used by default)
 humanize==4.11.0          # optional nicer size/time formatting

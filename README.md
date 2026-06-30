@@ -228,9 +228,19 @@ Notes:
 
 ## Library choices / notes
 
-- **Perceptual hashing** is implemented with `imagehash` + `Pillow` over frames
-  sampled by ffmpeg/OpenCV rather than the `videohash` package, which is
-  unmaintained and fragile on modern Python; this keeps the dependency robust.
+- **Perceptual hashing (M5)** is implemented in-process using only `opencv-python`
+  + `numpy` (both already required for frame sampling). The upstream `phash`
+  PyPI package wraps a C++ library that needs CMake/MSVC and famously fails
+  to install on Windows; the older recipe based on `imagehash` + `scipy` also
+  trips up minimal installs. VidComp ships its own 64-bit pHash so neither is
+  needed. If `imagehash` happens to be installed it is used as a drop-in
+  accelerator, otherwise the built-in path runs automatically.
+- **Metadata matching (M4)** requires duration + identical resolution + at
+  least two additional attributes (codec, fps, audio channels, or
+  bitrate-within-10 %) before flagging a pair. This avoids the common false
+  positive of two unrelated 1080p clips of similar duration being grouped
+  together — perceptual / structural methods (M5–M8) are the right tool for
+  catching re-encodes that legitimately changed resolution.
 - **SSIM/PSNR/VMAF** use ffmpeg's `lavfi` filters (no extra Python deps).
   `scikit-image` is listed as an optional SSIM fallback.
 - **Audio fingerprinting** uses `fpcalc` (Chromaprint) directly for raw

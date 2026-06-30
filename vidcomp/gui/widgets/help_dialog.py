@@ -34,9 +34,17 @@ not their filenames, then helps you delete the extras safely.</p>
   <li><b>M2 SHA-256</b> - confirms byte-identical duplicates.</li>
   <li><b>M3 Partial hash</b> - hashes the first+last bytes for a fast pre-check.</li>
   <li><b>M4 Metadata</b> - compares duration, resolution, codec, bitrate, fps,
-      audio channels via ffprobe.</li>
+      audio channels via ffprobe. A match now requires duration
+      <i>and</i> identical resolution <i>and</i> at least two more attributes
+      to agree, so unrelated clips that merely share a duration are no longer
+      grouped together.</li>
   <li><b>M5 Perceptual hash</b> - perceptual fingerprint of sampled frames;
-      matches within a Hamming-distance threshold.</li>
+      matches within a Hamming-distance threshold. Computed in-process with
+      OpenCV + NumPy so no <code>phash</code> / <code>imagehash</code> /
+      <code>scipy</code> install is needed (the upstream <code>phash</code>
+      package famously fails to build on Windows). Pairs whose aspect ratios
+      or durations differ widely are skipped to avoid false positives from
+      coincidental dark or low-detail frames.</li>
   <li><b>M6 SSIM</b> - structural similarity of aligned frames (0-1).</li>
   <li><b>M7 PSNR</b> - peak signal-to-noise ratio in dB.</li>
   <li><b>M8 VMAF</b> - Netflix perceptual quality metric (needs libvmaf).</li>
