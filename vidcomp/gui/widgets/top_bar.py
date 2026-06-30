@@ -42,7 +42,7 @@ class TopBar(QWidget):
 
         self.easy_btn = QRadioButton("Easy")
         self.easy_btn.setToolTip(
-            "Fast scan: size, partial hash, full SHA-256, and ffprobe metadata."
+            "Fast scan: size, partial hash, and full SHA-256."
         )
         self.medium_btn = QRadioButton("Medium")
         self.medium_btn.setToolTip(

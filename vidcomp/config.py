@@ -79,7 +79,15 @@ class ScanOptions:
         opts = cls()
         opts.mode = ScanMode(d.get("mode", ScanMode.EASY.value))
         opts.match_logic = MatchLogic(d.get("match_logic", MatchLogic.ANY.value))
-        opts.enabled_methods = {MethodId(m) for m in d.get("enabled_methods", [])}
+        # Tolerate unknown method identifiers in saved configs (e.g. legacy
+        # "metadata" entries from before M4 was removed) instead of crashing.
+        loaded_methods: set[MethodId] = set()
+        for m in d.get("enabled_methods", []):
+            try:
+                loaded_methods.add(MethodId(m))
+            except ValueError:
+                continue
+        opts.enabled_methods = loaded_methods
         for key in (
             "phash_threshold", "frame_samples", "ssim_threshold", "psnr_threshold",
             "vmaf_threshold", "audio_threshold", "partial_hash_bytes",
@@ -94,7 +102,7 @@ class ScanOptions:
 
 # --- Mode -> method mapping (Section 3 of the spec) ------------------------
 
-_EASY_METHODS = {MethodId.SIZE, MethodId.PARTIAL_HASH, MethodId.SHA256, MethodId.METADATA}
+_EASY_METHODS = {MethodId.SIZE, MethodId.PARTIAL_HASH, MethodId.SHA256}
 _MEDIUM_METHODS = _EASY_METHODS | {MethodId.PHASH}
 _ROBUST_METHODS = _MEDIUM_METHODS | {
     MethodId.SSIM, MethodId.PSNR, MethodId.VMAF, MethodId.AUDIO,

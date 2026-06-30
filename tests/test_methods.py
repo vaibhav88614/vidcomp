@@ -1,4 +1,4 @@
-"""Unit tests for the individual comparison methods (M1-M9)."""
+"""Unit tests for the individual comparison methods (M1-M9, sans M4)."""
 
 from __future__ import annotations
 
@@ -9,7 +9,6 @@ import pytest
 from vidcomp.core.methods.m1_size import SizeMethod
 from vidcomp.core.methods.m2_sha256 import Sha256Method, sha256_of
 from vidcomp.core.methods.m3_partial_hash import PartialHashMethod, partial_hash_of
-from vidcomp.core.methods.m4_metadata import MetadataMethod
 from vidcomp.core.methods.m9_audio import _bit_similarity, _to_ints
 from vidcomp.core.models import MediaInfo
 
@@ -64,21 +63,6 @@ def test_partial_hash_distinguishes_size(tmp_path):
     h1 = partial_hash_of(str(p), 6, 1024)
     h2 = partial_hash_of(str(p), 999, 1024)  # different declared size
     assert h1 != h2
-
-
-def test_metadata_match(ctx):
-    info_a = MediaInfo(duration=120.0, width=1920, height=1080, video_codec="h264",
-                       fps=30.0, audio_channels=2, bitrate=5_000_000, has_video=True, ok=True)
-    info_b = MediaInfo(duration=120.4, width=1920, height=1080, video_codec="h264",
-                       fps=30.0, audio_channels=2, bitrate=5_100_000, has_video=True, ok=True)
-    info_c = MediaInfo(duration=300.0, width=640, height=480, video_codec="mpeg4",
-                       fps=24.0, has_video=True, ok=True)
-    a = make_video("a.mp4", 1, info=info_a)
-    b = make_video("b.mp4", 2, info=info_b)
-    c = make_video("c.mp4", 3, info=info_c)
-    m = MetadataMethod()
-    assert m.compare(a, b, ctx) is not None
-    assert m.compare(a, c, ctx) is None
 
 
 def test_audio_similarity():

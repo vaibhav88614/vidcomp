@@ -37,64 +37,55 @@ def test_size_only_grouping():
 
 
 def test_size_alone_is_not_a_match():
-    # Same byte size but different content/metadata must NOT be grouped:
+    # Same byte size but different content must NOT be grouped:
     # M1 is a pre-filter, not a standalone vote, when stronger methods exist.
     files = [
         make_video("a.mp4", 100, info=_info(60)),
         make_video("b.mp4", 100, info=_info(999)),
     ]
+    # Pair SIZE with SHA256 (which will abstain on both files because their
+    # paths don't exist on disk, so no hash is computed) to confirm SIZE alone
+    # cannot carry a match when another voting method is enabled.
     opts = ScanOptions(
-        enabled_methods={MethodId.SIZE, MethodId.METADATA}, match_logic=MatchLogic.ANY
+        enabled_methods={MethodId.SIZE, MethodId.SHA256}, match_logic=MatchLogic.ANY
     )
     groups = DuplicateEngine(StubTools(), opts).run(files)
     assert groups == []
 
 
 def test_any_vs_all_logic(tmp_path):
-    # f1/f2 are byte-identical; f3 is a "re-encode": different bytes but the
-    # same duration/resolution/codec metadata.
+    # f1/f2 are byte-identical, f3 has different bytes.  With SHA256 alone we
+    # expect f1/f2 to group whether the logic is ANY or ALL; with SIZE+SHA256
+    # the SIZE method is treated as a pre-filter (not a vote) so the outcome
+    # is the same.
     identical = b"VID" + b"\x00" * 8000
     f1 = tmp_path / "f1.mp4"
     f2 = tmp_path / "f2.mp4"
     f3 = tmp_path / "f3.mp4"
     f1.write_bytes(identical)
     f2.write_bytes(identical)
-    f3.write_bytes(b"OTHER" + b"\x01" * 5000)  # different size + content
+    f3.write_bytes(b"OTHER" + b"\x01" * 5000)
 
-    files = [
-        make_video(str(f1), f1.stat().st_size, info=_info(120.0)),
-        make_video(str(f2), f2.stat().st_size, info=_info(120.0)),
-        make_video(str(f3), f3.stat().st_size, info=_info(120.0)),
-    ]
-    methods = {MethodId.SHA256, MethodId.METADATA}
+    def _make_files():
+        return [
+            make_video(str(f1), f1.stat().st_size, info=_info(120.0)),
+            make_video(str(f2), f2.stat().st_size, info=_info(120.0)),
+            make_video(str(f3), f3.stat().st_size, info=_info(120.0)),
+        ]
 
-    any_opts = ScanOptions(enabled_methods=set(methods), match_logic=MatchLogic.ANY)
-    any_groups = DuplicateEngine(StubTools(), any_opts).run([
-        make_video(str(f1), f1.stat().st_size, info=_info(120.0)),
-        make_video(str(f2), f2.stat().st_size, info=_info(120.0)),
-        make_video(str(f3), f3.stat().st_size, info=_info(120.0)),
-    ])
-    # ANY: f3 matches f1/f2 by metadata, so all three collapse into one group.
+    any_opts = ScanOptions(
+        enabled_methods={MethodId.SHA256}, match_logic=MatchLogic.ANY
+    )
+    any_groups = DuplicateEngine(StubTools(), any_opts).run(_make_files())
     assert len(any_groups) == 1
-    assert len(any_groups[0].files) == 3
+    assert {f.name for f in any_groups[0].files} == {"f1.mp4", "f2.mp4"}
 
-    all_opts = ScanOptions(enabled_methods=set(methods), match_logic=MatchLogic.ALL)
-    all_groups = DuplicateEngine(StubTools(), all_opts).run(files)
-    # ALL: f3 fails SHA-256, so only the byte-identical f1+f2 group.
+    all_opts = ScanOptions(
+        enabled_methods={MethodId.SHA256}, match_logic=MatchLogic.ALL
+    )
+    all_groups = DuplicateEngine(StubTools(), all_opts).run(_make_files())
     assert len(all_groups) == 1
     assert {f.name for f in all_groups[0].files} == {"f1.mp4", "f2.mp4"}
-
-
-def test_duration_bucket_candidates_for_reencode():
-    # Different sizes (re-encode) but near-identical duration + metadata.
-    files = [
-        make_video("orig.mp4", 5_000_000, info=_info(120.0)),
-        make_video("reenc.mp4", 2_000_000, info=_info(120.3)),
-    ]
-    opts = ScanOptions(enabled_methods={MethodId.METADATA}, match_logic=MatchLogic.ANY)
-    groups = DuplicateEngine(StubTools(), opts).run(files)
-    assert len(groups) == 1
-    assert len(groups[0].files) == 2
 
 
 def test_no_methods_returns_empty():

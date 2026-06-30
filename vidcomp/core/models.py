@@ -48,12 +48,15 @@ class DeleteMode(str, Enum):
 
 
 class MethodId(str, Enum):
-    """Stable identifiers for the nine comparison methods (M1-M9)."""
+    """Stable identifiers for the comparison methods (M1-M9).
+
+    M4 (ffprobe metadata matching) was removed; the identifier is intentionally
+    not reused.
+    """
 
     SIZE = "size"  # M1
     SHA256 = "sha256"  # M2
     PARTIAL_HASH = "partial_hash"  # M3
-    METADATA = "metadata"  # M4
     PHASH = "phash"  # M5
     SSIM = "ssim"  # M6
     PSNR = "psnr"  # M7
@@ -66,7 +69,6 @@ METHOD_LABELS: dict[MethodId, str] = {
     MethodId.SIZE: "M1 - File size",
     MethodId.SHA256: "M2 - SHA-256 full hash",
     MethodId.PARTIAL_HASH: "M3 - Partial/quick hash",
-    MethodId.METADATA: "M4 - Metadata (ffprobe)",
     MethodId.PHASH: "M5 - Perceptual hash",
     MethodId.SSIM: "M6 - SSIM",
     MethodId.PSNR: "M7 - PSNR",

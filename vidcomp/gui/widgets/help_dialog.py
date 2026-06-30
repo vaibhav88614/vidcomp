@@ -20,7 +20,7 @@ not their filenames, then helps you delete the extras safely.</p>
 <h3>Scan modes</h3>
 <ul>
   <li><b>Easy</b> - fast. Finds exact / near-exact copies using file size,
-      a quick head+tail hash, full SHA-256, and ffprobe metadata.</li>
+      a quick head+tail hash and a full SHA-256.</li>
   <li><b>Medium</b> - balanced. Everything in Easy plus perceptual hashing of
       sampled frames, so it also catches re-encoded or resized copies.</li>
   <li><b>Robust</b> - thorough but slow. Everything in Medium plus frame SSIM
@@ -33,11 +33,6 @@ not their filenames, then helps you delete the extras safely.</p>
   <li><b>M1 File size</b> - instant pre-filter grouping equal-sized files.</li>
   <li><b>M2 SHA-256</b> - confirms byte-identical duplicates.</li>
   <li><b>M3 Partial hash</b> - hashes the first+last bytes for a fast pre-check.</li>
-  <li><b>M4 Metadata</b> - compares duration, resolution, codec, bitrate, fps,
-      audio channels via ffprobe. A match now requires duration
-      <i>and</i> identical resolution <i>and</i> at least two more attributes
-      to agree, so unrelated clips that merely share a duration are no longer
-      grouped together.</li>
   <li><b>M5 Perceptual hash</b> - perceptual fingerprint of sampled frames;
       matches within a Hamming-distance threshold. Computed in-process with
       OpenCV + NumPy so no <code>phash</code> / <code>imagehash</code> /
@@ -50,6 +45,10 @@ not their filenames, then helps you delete the extras safely.</p>
   <li><b>M8 VMAF</b> - Netflix perceptual quality metric (needs libvmaf).</li>
   <li><b>M9 Audio fingerprint</b> - Chromaprint match of the audio track.</li>
 </ul>
+<p style='color:#888888'><i>Note: M4 (ffprobe metadata matching) was removed
+because it produced too many false positives — two unrelated clips of the
+same duration / resolution were being grouped together. Real re-encodes are
+caught by M5–M8 instead.</i></p>
 
 <h3>Match logic</h3>
 <p><b>ANY</b> flags a pair if a single enabled method agrees (more matches).

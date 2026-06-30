@@ -8,7 +8,7 @@ It uses a tiered, escalating comparison pipeline so that cheap filters run first
 and expensive metrics only run on surviving candidates:
 
 ```
-size  ->  partial hash  ->  SHA-256 / metadata  ->  perceptual hash  ->  SSIM / PSNR / VMAF / audio
+size  ->  partial hash  ->  SHA-256  ->  perceptual hash  ->  SSIM / PSNR / VMAF / audio
 ```
 
 ---
@@ -81,9 +81,8 @@ python main.py
 
 ## How the scan modes work (plain language)
 
-- **Easy (fast):** Groups files by size, then confirms exact copies with a quick
-  head+tail hash and a full SHA-256, and compares ffprobe metadata (duration,
-  resolution, codec, bitrate, fps, audio channels). Great for finding literal
+- **Easy (fast):** Groups files by size, then confirms exact copies with a
+  quick head+tail hash and a full SHA-256. Great for finding literal
   duplicate files with different names.
 
 - **Medium (balanced):** Everything in Easy, plus **perceptual hashing**: it
@@ -97,12 +96,19 @@ python main.py
 
 ## The methods (M1-M9)
 
+> **Note:** M4 (ffprobe metadata matching) was removed because it produced too
+> many false positives in practice — two unrelated clips that happened to share
+> a duration / resolution / codec were being flagged as duplicates. Real
+> re-encodes are caught by M5–M8 instead. The M4 slot is intentionally left
+> blank below; identifiers are not renumbered so existing logs / caches / tests
+> stay consistent.
+
 | ID | Method | What it does |
 |----|--------|--------------|
 | M1 | File size | Instant pre-filter; groups equal-sized files. |
 | M2 | SHA-256 | Confirms byte-identical duplicates. |
 | M3 | Partial hash | Hashes first+last N bytes for a fast pre-check. |
-| M4 | Metadata | Compares duration/resolution/codec/bitrate/fps/audio via ffprobe. |
+| ~~M4~~ | ~~Metadata~~ | Removed (unreliable — see note above). |
 | M5 | Perceptual hash | pHash of sampled frames; Hamming-distance threshold. |
 | M6 | SSIM | Structural similarity of aligned frames (0-1). |
 | M7 | PSNR | Peak signal-to-noise ratio (dB). |
@@ -235,12 +241,14 @@ Notes:
   trips up minimal installs. VidComp ships its own 64-bit pHash so neither is
   needed. If `imagehash` happens to be installed it is used as a drop-in
   accelerator, otherwise the built-in path runs automatically.
-- **Metadata matching (M4)** requires duration + identical resolution + at
-  least two additional attributes (codec, fps, audio channels, or
-  bitrate-within-10 %) before flagging a pair. This avoids the common false
-  positive of two unrelated 1080p clips of similar duration being grouped
-  together — perceptual / structural methods (M5–M8) are the right tool for
-  catching re-encodes that legitimately changed resolution.
+- **Metadata matching (M4) was removed.** Comparing duration / resolution /
+  codec / bitrate cannot reliably distinguish two unrelated clips that happen
+  to share those attributes (e.g. two different 1080p H.264 episodes of the
+  same length), and even tightened gates produced false positives. The
+  ffprobe-derived `MediaInfo` is still produced and cached for the methods
+  that genuinely need it (M5 pHash sanity guards, SSIM/PSNR/VMAF). Saved
+  configs with `"metadata"` in `enabled_methods` are loaded with that entry
+  silently dropped.
 - **SSIM/PSNR/VMAF** use ffmpeg's `lavfi` filters (no extra Python deps).
   `scikit-image` is listed as an optional SSIM fallback.
 - **Audio fingerprinting** uses `fpcalc` (Chromaprint) directly for raw

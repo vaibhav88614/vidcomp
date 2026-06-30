@@ -1,8 +1,8 @@
 """Scan orchestration: prepare signatures, generate candidates, group matches.
 
 The engine follows the performance rule from the spec: run cheap filters first
-(size -> metadata/hash -> perceptual hash) and only escalate to expensive
-pairwise metrics (SSIM/PSNR/VMAF/audio) on surviving candidate pairs.
+(size -> hashes -> perceptual hash) and only escalate to expensive pairwise
+metrics (SSIM/PSNR/VMAF/audio) on surviving candidate pairs.
 
 It is fully GUI-independent and communicates progress/log/error purely through
 callbacks, so it can be driven from a worker thread or a headless script.
@@ -40,7 +40,7 @@ LogCb = Callable[[str], None]
 ErrorCb = Callable[[str, str], None]            # (path, message)
 
 # Methods that are cheap signature/bucketing comparisons.
-_CHEAP = {MethodId.SIZE, MethodId.SHA256, MethodId.PARTIAL_HASH, MethodId.METADATA, MethodId.PHASH}
+_CHEAP = {MethodId.SIZE, MethodId.SHA256, MethodId.PARTIAL_HASH, MethodId.PHASH}
 _EXPENSIVE = {MethodId.SSIM, MethodId.PSNR, MethodId.VMAF, MethodId.AUDIO}
 
 # Above this many files we avoid the all-pairs fallback to stay tractable.
@@ -209,7 +209,7 @@ class DuplicateEngine:
             sorted(m.value for m in usable.keys()),
         )
         enabled = set(usable.keys())
-        need_info = bool(enabled & {MethodId.METADATA, MethodId.PHASH, MethodId.SSIM, MethodId.PSNR, MethodId.VMAF})
+        need_info = bool(enabled & {MethodId.PHASH, MethodId.SSIM, MethodId.PSNR, MethodId.VMAF})
 
         # Size-bucket optimization: only fully hash files that share a size.
         size_groups: dict[int, list[int]] = {}
@@ -312,7 +312,7 @@ class DuplicateEngine:
             else:
                 self._log(
                     f"Too many files ({len(files)}) for all-pairs fallback; "
-                    "enable size/metadata methods to narrow candidates."
+                    "enable size/hash methods to narrow candidates."
                 )
         return sorted(pairs)
 
